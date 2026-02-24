@@ -189,3 +189,7 @@ config/private*.yaml
 *.html
 llada2_1_tech_report.html
 LLaDA2.0_*.html
+
+
+*
+Hilda NEXT Full Architecture.md
