@@ -1,0 +1,32 @@
+# HildaNext backend package
+# Entrypoint: hildanext CLI
+# Python target: >=3.11
+[build-system]
+requires=["setuptools>=69","wheel"]
+build-backend="setuptools.build_meta"
+[project]
+name="hildanext-backend"
+version="0.1.0"
+description="HILDA SAFE backend for AR->dLLM conversion, SFT, and inference"
+requires-python=">=3.10"
+dependencies=[
+  "torch>=2.4",
+  "transformers>=4.51",
+  "numpy>=1.26",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2.8",
+  "tqdm>=4.66"
+]
+[project.optional-dependencies]
+data=["datasets>=2.20","huggingface_hub>=0.24"]
+quant=["bitsandbytes>=0.43"]
+[project.scripts]
+hildanext="hildanext.cli:main"
+[tool.setuptools]
+package-dir={""="src"}
+[tool.setuptools.packages.find]
+where=["src"]
+[tool.pytest.ini_options]
+addopts="-q"
+testpaths=["tests"]

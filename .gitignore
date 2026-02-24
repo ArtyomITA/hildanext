@@ -1,0 +1,191 @@
+# =============================================================================
+# REPO PERSONALE — HildaNext
+# Tutto ciò che NON deve finire su git (solo il codice va versionato)
+# =============================================================================
+
+
+# =============================================================================
+# [FORK / REPO ESTERNI]
+# Questi folder hanno la propria .git che punta a repo di terzi.
+# Vanno completamente esclusi dal root repo per evitare push accidentali
+# su GitHub/HuggingFace di altri (ML-GSAI, Qwen, allenai, inclusionAI…)
+# =============================================================================
+LLaDA/
+Qwen3-0.6B/
+hildanext/vendor/dinfer/
+hildanext/vendor/dolma_urls/
+hildanext/vendor/llada/
+
+
+# =============================================================================
+# [PESI MODELLO / CHECKPOINT / FILE BINARI GRANDI]
+# Modelli, checkpoint, quantizzazioni — possono pesare GB
+# =============================================================================
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.ggml
+*.q4_0
+*.q4_1
+*.q8_0
+*.onnx
+*.tflite
+*.pb
+*.mlpackage
+*.mlmodel
+# Cartelle modelli scaricati
+models/qwen*/
+models/llada*/
+models/exports/
+hildanext/models/
+# File LFS
+*.lfs
+
+
+# =============================================================================
+# [DATASET / DATI GREZZI / FILE GRANDI]
+# Dati Dolma, Parquet, Arrow, HDF5 e simili non appartengono al VCS
+# =============================================================================
+dolma_v1_6_sample_*/
+hildanext/data/dolma/
+hildanext/data/processed/
+hildanext/data/tokenized/
+hildanext/data/raw/
+hildanext/data/curated/
+# Formati dati pesanti
+*.parquet
+*.arrow
+*.feather
+*.hdf5
+*.h5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.msgpack
+*.jsonl.gz
+*.txt.gz
+*.zst
+# Grandi archivi
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.zip
+*.7z
+*.rar
+
+
+# =============================================================================
+# [ARTEFATTI DI ESECUZIONE — runs/, logs, cache]
+# Output di training, eval, cache temporanea
+# =============================================================================
+hildanext/runs/cache/
+hildanext/runs/logs/
+hildanext/runs/console/
+hildanext/runs/reports/
+hildanext/runs/_archive/
+hildanext/docs/reports/
+# Tensorboard / wandb
+runs/
+wandb/
+lightning_logs/
+*.tfevents.*
+# Config effimeri generati automaticamente (tenere solo quelli scritti a mano)
+hildanext/runs/configs/*.auto.yaml
+hildanext/runs/configs/*.tmp.yaml
+
+
+# =============================================================================
+# [PYTHON — AMBIENTE VIRTUALE, CACHE, BUILD]
+# =============================================================================
+.venv/
+venv/
+env/
+.env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+# Build / dist
+*.egg-info/
+dist/
+build/
+*.egg
+MANIFEST
+# Type stubs generati
+*.pyi
+# Coverage & test cache
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+*.tox
+# MyPy
+.mypy_cache/
+.dmypy.json
+# Ruff / linting cache
+.ruff_cache/
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+
+# =============================================================================
+# [IDE / EDITOR]
+# =============================================================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+
+# =============================================================================
+# [SISTEMA OPERATIVO]
+# =============================================================================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+# Linux
+*.bak
+*.tmp
+
+
+# =============================================================================
+# [SECRETS / CREDENZIALI]
+# MAI pushare token, chiavi API, env locali
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+secrets/
+credentials/
+config/local*.yaml
+config/private*.yaml
+
+
+# =============================================================================
+# [HTML / REPORT TECNICI DI TERZI]
+# File HTML scaricati di paper / documenti esterni — non sono codice tuo
+# =============================================================================
+*.html
+llada2_1_tech_report.html
+LLaDA2.0_*.html
