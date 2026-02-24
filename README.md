@@ -1,4 +1,4 @@
-# HILDA — Hybrid Iterative Learning with Diffusion Adaptation
+# HILDA
 
 > **Give any autoregressive transformer a discrete-diffusion brain, teach it to reason, and serve it on hardware from 2017.**
 
@@ -185,21 +185,108 @@ hildanext/
 - [x] CLI `hildanext generate`
 
 ### Stage 3 — RL Reasoning 🔬
-- [ ] ESPO (ELBO sequence-level RL baseline)
-- [ ] AGRPO — step-aware policy gradient for dLLM
-- [ ] GSM8K + HumanEval verifiable reward loop
+
+This is the most research-heavy stage. Each component needs its own ablation run before stacking.
+
+**3a — Reward infrastructure**
+- [ ] Verifiable reward runner: GSM8K exact-match scorer, HumanEval pass@k executor
+- [ ] Rollout sampler: generate N completions per prompt under current dLLM policy (S_MODE / Q_MODE)
+- [ ] Rollout budget cap per step (critical on 8 GB — no uncapped MC rollouts)
+- [ ] Reward normalisation and advantage estimation utilities
+- [ ] Baseline: measure raw SFT model accuracy on GSM8K and HumanEval before any RL
+
+**3b — ESPO (default RL objective)**
+- [ ] ELBO-based sequence-level reward proxy implementation
+- [ ] Ratio-stabilised KL penalty (clipped, no token-level factorisation)
+- [ ] Training loop: rollout → reward → ELBO gradient → parameter update
+- [ ] Evaluation: ESPO vs SFT baseline — GSM8K accuracy δ, ELBO convergence curve
+- [ ] Ablation: KL weight sweep (β ∈ {0.01, 0.05, 0.1}) — report accuracy vs reward collapse
+
+**3c — wd1 / wd1++ (ratio-free alternative)**
+- [ ] Implement weighted log-likelihood objective without ratio estimation
+- [ ] wd1++ step-wise variant (per-diffusion-step weighting)
+- [ ] Comparison run: wd1 vs ESPO on same GSM8K subset, same compute budget
+- [ ] Metric: gradient variance per step, accuracy, training stability (loss curve)
+
+**3d — AGRPO (Monte-Carlo faithful policy gradient)**
+- [ ] MC rollout estimator for step-aware dLLM policy gradient
+- [ ] Integration with existing threshold-edit decode loop as action space
+- [ ] Comparison run: AGRPO vs ESPO vs wd1 — three-way table on GSM8K + HumanEval
+- [ ] Ablation: number of MC samples (K ∈ {4, 8, 16}) vs accuracy vs VRAM
+
+**3e — Efficiency upgrades for 8 GB VRAM**
+- [ ] STP (spatio-temporal pruning): skip redundant denoising steps during rollout
+  - Baseline: rollout step count and wall time without STP
+  - After: same accuracy target, measure step reduction %
+- [ ] LENS: filter instruction-interfering tokens from rollout prompts
+  - Baseline: rollout success rate on GSM8K prompts without filtering
+  - After: success rate δ and variance δ across prompt phrasings
+- [ ] R³L reflect-then-retry (bounded to max 2 retries per step to avoid forward-pass explosion)
+  - Comparison: R³L vs AGRPO on multi-step reasoning tasks (MATH subset)
+
+**3f — Full RL evaluation suite**
+- [ ] GSM8K (math word problems, exact match)
+- [ ] MATH-500 subset (harder symbolic reasoning, directional signal)
+- [ ] HumanEval (code, pass@1 and pass@10)
+- [ ] TinyStories perplexity regression check (make sure RL doesn't break fluency)
+- [ ] Final comparison table: SFT → ESPO → best-RL across all benchmarks
 
 ### Stage 4 — FULL Acceleration 🔬
-- [ ] RCD residual carry-over in denoise loop
-- [ ] D2F / Fast-dLLM v2 hierarchical KV caching
-- [ ] Order-Token Search decoding plugin
-- [ ] KVzap / KVpress cache compression
+
+All components here must be benchmarked against the Stage 2 threshold-edit decode baseline before being considered merged.
+
+**4a — Residual Context Diffusion (RCD)**
+- [ ] Implement residual carry-over state between denoise steps (hidden representations from remasked positions)
+- [ ] Two-stage training: Stage-0 base → RCD fine-tune (keep same corruption process, same ELBO estimator)
+- [ ] ELBO audit: verify estimator alignment before and after RCD activation
+- [ ] Baseline comparison: with/without RCD — perplexity, mask ratio per step, total denoise steps to convergence
+- [ ] Ablation: residual injection weight α ∈ {0.1, 0.3, 0.5}
+- [ ] Cost check: measure added VRAM and wall-time per step vs quality gain
+
+**4b — D2F / Fast-dLLM v2 hierarchical KV caching**
+- [ ] Block-level KV cache implementation (cache per diffusion block, invalidate on edit)
+- [ ] Sub-block cache layer (fine-grained reuse within a block across denoising steps)
+- [ ] Baseline: tokens/sec and VRAM peak without caching (current threshold-edit loop)
+- [ ] After: tokens/sec δ, VRAM δ, quality delta on HumanEval and TinyStories
+- [ ] Integration test: verify cache invalidation correctness under T2T edits (no stale KV)
+- [ ] Target: ~1B token adaptation budget — track token count in training logs
+
+**4c — CARD confidence-adaptive generation**
+- [ ] Variable tokens-per-step decoding: generate more tokens when max confidence > threshold, fall back to sequential when uncertain
+- [ ] Confidence estimator: calibrated softmax head or running mean of top-1 probability
+- [ ] Baseline: fixed tokens-per-step at τ_mask=0.5 (current Q_MODE)
+- [ ] After: average steps to complete a 256-token response, quality on GSM8K
+- [ ] Ablation: confidence gate threshold sweep vs speed/quality Pareto frontier
+
+**4d — Order-Token Search (decoding plugin)**
+- [ ] Implement search over generation order trajectories in addition to token choices
+- [ ] Beam budget parameter (B ∈ {1, 2, 4}) — B=1 must equal current greedy baseline exactly
+- [ ] Baseline: greedy threshold-edit (current S_MODE) on HumanEval pass@1 and GSM8K
+- [ ] After: pass@1 δ and pass@10 δ at B=2 and B=4
+- [ ] Cost/quality table: inference FLOPs and wall-time vs accuracy for each B
+- [ ] Note: this is a zero-training-change plugin — comparison must hold training constant
+
+**4e — KVzap / KVpress cache compression**
+- [ ] KVzap adaptive pruning: drop least-attended KV entries with explicit target compression ratio
+- [ ] Target ratios: 2× and 4× — measure quality degradation at each
+- [ ] Baseline: full KV cache, no pruning — tokens/sec, VRAM, quality
+- [ ] After: tokens/sec δ, VRAM δ, perplexity δ at 2× and 4× compression
+- [ ] Integration: combine with D2F block cache and verify no double-pruning bugs
+
+**4f — C2DLM structural supervision (FULL training)**
+- [ ] Build concept-level causal graph from training data (entity/clause extraction)
+- [ ] Supervised attention mask injection on T2T correction passes
+- [ ] V-aware re-attention weighting implementation
+- [ ] Baseline: SFT without C2DLM on GSM8K chain-of-thought quality (step correctness rate)
+- [ ] After: step correctness rate δ and TinyStories coherence score δ
+- [ ] Ablation: C2DLM applied only on T2T passes vs applied always (expected: T2T-only is more stable)
 
 ### Hardware / Tooling
 - [x] Pascal sm_61 compatible — no FlashAttention, no vLLM required
 - [x] CPU-only demo mode
 - [x] QLoRA / bitsandbytes optional path
 - [ ] ONNX export
+- [ ] Automated benchmark runner: one command to reproduce all comparison tables
 
 ---
 
