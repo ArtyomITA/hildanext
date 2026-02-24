@@ -2,9 +2,7 @@
 
 > **Give any autoregressive transformer a discrete-diffusion brain, teach it to reason, and serve it on hardware from 2017.**
 
-HILDA is a research architecture and end-to-end backend for **converting AR transformers into editable discrete diffusion language models (dLLMs)**, then pushing them through supervised fine-tuning, RL-based reasoning alignment, and accelerated serving — all on a single consumer GPU.
-
-The thesis: diffusion LMs can match or beat AR models of the same size when built with the right training mechanics, and the full pipeline should fit inside 8 GB VRAM.
+HILDA is a research architecture and end-to-end backend that converts pretrained AR transformers into **editable discrete diffusion language models**, trains them to reason with RL, and serves them efficiently — all designed to run on a single consumer GPU.
 
 ---
 
@@ -35,7 +33,7 @@ Training objective is a mixture of M2T and T2T losses with doc-level attention m
 
 ### 2 — WSD Conversion Schedule
 
-HILDA converts an existing AR model rather than training from scratch. The **Warmup-Stable-Decay** schedule bridges the two paradigms:
+HILDA converts an existing AR model rather than training from scratch via **Warmup-Stable-Decay**:
 
 ```
 Warmup  → block size grows 1 → N  (AR treated as BDLM, block size = 1)
@@ -43,7 +41,7 @@ Stable  → full-sequence MDLM regime (stabilise ELBO and diffusion dynamics)
 Decay   → shrink block, consolidate editable representation
 ```
 
-The CPT objective combines M2T loss on masked positions with T2T loss on noised observed positions. This is the cheapest path from a pretrained AR to a capable dLLM — no training from scratch, no architecture surgery.
+CPT objective: M2T loss on masked positions + T2T loss on noised observed positions. No training from scratch, no architecture surgery.
 
 ### 3 — Structural Supervision: C2DLM *(FULL profile)*
 
@@ -109,18 +107,6 @@ Planned upgrades (FULL profile):
 
 ---
 
-## Acceleration Roadmap (Stage 3, FULL)
-
-| Technique | What it does |
-|---|---|
-| **RCD** — Residual Context Diffusion | Recycles hidden states discarded by remasking as residual context for the next step — reduces wasted compute |
-| **D2F / Fast-dLLM v2** | Hierarchical KV caching (block + sub-block level) enabling inter-block parallelism; ~1B token fine-tune cost |
-| **CARD** | Confidence-adaptive token generation: more tokens per step at high confidence, sequential fallback otherwise |
-| **Order-Token Search** | Decoding-time search over generation order and token trajectories — quality gains with no training change |
-| **KVzap / KVpress** | Adaptive KV cache pruning, 2–4× compression with minimal quality loss |
-
----
-
 ## Tech Stack
 
 | Layer | Tool |
@@ -171,18 +157,24 @@ hildanext/
 - [x] Doc-level attention masking from `doc_ids`
 - [x] Dolma v1.6 + TinyStories data pipeline
 - [x] Tokenisation and packing with doc boundary tracking
+- [x] Special token registration for `[MASK]` without embedding remap
+- [x] ELBO logging per training step
 
 ### Stage 1 — SFT ✅
 - [x] Response-focused M2T+T2T mixture loss
 - [x] Multi-turn forward (two T2T noising passes per step)
-- [x] SFT smoke test
+- [x] Multi-turn conversation format with turn boundary masking
+- [x] Train/eval split with held-out SFT shard
+- [x] SFT smoke test (dummy batch, loss finite check)
 
 ### Stage 2 — Inference & Serving ✅
 - [x] Threshold-edit decode loop (Γt + Δt)
 - [x] `S_MODE` / `Q_MODE` presets
 - [x] dInfer adapter + Transformers fallback
-- [x] FastAPI REST server
+- [x] FastAPI REST server with `/health`, `/generate`, `/jobs/*`
 - [x] CLI `hildanext generate`
+- [x] Per-step decode tracing (mask ratio, edit count, throughput estimate)
+- [x] Inference smoke test against dummy model (no weights required)
 
 ### Stage 3 — RL Reasoning 🔬
 
@@ -201,10 +193,10 @@ Three objectives, one controlled comparison run on the same GSM8K subset and com
 - [ ] **AGRPO**: MC rollout estimator step-aware policy gradient (K samples: 4 / 8 / 16)
 - [ ] Output: three-way comparison table — accuracy δ, gradient variance, VRAM peak, training stability
 
-**3c — Efficiency plugins for 8 GB rollouts**
-- [ ] **STP**: spatio-temporal pruning of redundant denoising steps — target: same accuracy, fewer steps
-- [ ] **LENS**: filter instruction-interfering tokens before rollout — target: higher success rate, lower variance across prompt phrasings
-- [ ] **R³L**: reflect-then-retry credit assignment, max 2 retries per step to cap forward-pass cost
+**3c — Efficiency plugins for small-model rollouts**
+- [ ] **STP**: spatio-temporal pruning of redundant denoising steps — same accuracy, fewer steps
+- [ ] **LENS**: filter instruction-interfering tokens before rollout — higher success rate, lower variance across prompt phrasings
+- [ ] **R³L**: reflect-then-retry credit assignment, max 2 retries per step to keep forward-pass count tractable on small models
 - [ ] Applied on top of the best objective from 3b; one combined comparison vs 3b-winner baseline
 
 **3d — Full evaluation**
@@ -214,39 +206,22 @@ Three objectives, one controlled comparison run on the same GSM8K subset and com
 
 ### Stage 4 — FULL Acceleration 🔬
 
-All components are benchmarked against the Stage 2 threshold-edit decode baseline (no caching, no search, no residuals). Metrics shared across all items: tokens/sec, VRAM peak, perplexity δ, HumanEval pass@1 δ.
+All components benchmarked against the Stage 2 threshold-edit decode baseline. Shared metrics: tokens/sec, VRAM peak, perplexity δ, HumanEval pass@1 δ.
 
-**4a — Residual Context Diffusion (RCD)**
-- [ ] Residual carry-over state between denoise steps (hidden reps from remasked positions)
-- [ ] Two-stage fine-tune on top of Stage-0 base; ELBO audit before/after to verify estimator alignment
-- [ ] Ablation: injection weight α ∈ {0.1, 0.3, 0.5} — pick best before moving on
+**4a — Quality stack: RCD + C2DLM**
+- [ ] **RCD**: residual carry-over of remasked hidden states between denoise steps; ELBO audit before/after; ablation on injection weight α ∈ {0.1, 0.3, 0.5}
+- [ ] **C2DLM**: concept-level causal graph, supervised attention mask applied on T2T passes only; V-aware re-attention weighting; ablation T2T-only vs always-on
+- [ ] Evaluation: quality stack table — SFT → +RCD → +RCD+C2DLM on GSM8K and TinyStories
 
-**4b — D2F / Fast-dLLM v2 hierarchical KV caching**
-- [ ] Block-level KV cache (invalidate on T2T edit) + sub-block reuse within a block
-- [ ] Integration test: no stale KV under edit — must pass before measuring speed
-- [ ] Target: ~1B token adaptation budget tracked in training logs
+**4b — Speed stack: KV caching + compression + adaptive decoding**
+- [ ] **D2F / Fast-dLLM v2**: block-level KV cache (invalidate on T2T edit) + sub-block reuse; integration test for stale-KV correctness under edits
+- [ ] **KVzap**: adaptive KV pruning at 2× and 4× ratios; verify no double-pruning with D2F cache
+- [ ] **CARD**: variable tokens-per-step when top-1 confidence > gate; Pareto curve vs fixed Q_MODE τ_mask=0.5
+- [ ] Evaluation: speed stack table — baseline → +D2F → +D2F+KVzap → +D2F+KVzap+CARD
 
-**4c — CARD confidence-adaptive generation**
-- [ ] Variable tokens-per-step: more tokens when top-1 confidence > gate, sequential fallback otherwise
-- [ ] Confidence gate sweep → speed/quality Pareto curve; compare vs fixed Q_MODE τ_mask=0.5
-
-**4d — Order-Token Search (decoding plugin, zero training change)**
+**4c — Decoding search: Order-Token Search**
 - [ ] Search over generation order trajectories; beam B ∈ {1, 2, 4} — B=1 must reproduce greedy baseline exactly
-- [ ] Cost/quality table: FLOPs and wall-time per B value
-
-**4e — KVzap / KVpress cache compression**
-- [ ] Adaptive KV pruning at 2× and 4× target ratios
-- [ ] Integration check: combine with D2F block cache, verify no double-pruning
-
-**4f — C2DLM structural supervision (FULL training)**
-- [ ] Concept-level causal graph from training data; supervised attention mask on T2T passes only
-- [ ] V-aware re-attention weighting
-- [ ] Ablation: T2T-only vs always-on (hypothesis: T2T-only is more stable on small models)
-
-**4g — Full acceleration evaluation**
-- [ ] Comparison table: Stage-2 baseline → 4b → 4b+4e → 4b+4c+4e (speed stack)
-- [ ] Quality table: Stage-1 SFT → 4a → 4a+4f (quality stack) on GSM8K and TinyStories
-- [ ] Best decoding: greedy vs Order-Token Search B=2, quality-only track (no speed penalty expected)
+- [ ] Zero training change; compare vs S_MODE greedy on HumanEval pass@1 and GSM8K; cost/quality table per B
 
 ### Hardware / Tooling
 - [x] Pascal sm_61 compatible — no FlashAttention, no vLLM required
