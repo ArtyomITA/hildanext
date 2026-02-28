@@ -237,7 +237,7 @@ def cmd_run_wsd(args):
         if not args.skip_preflight:
             pf=preflight_wsd(cfg,trace=tr)
             _print({"preflight":pf})
-        rep=run_wsd(cfg,args.config,trace=tr)
+        rep=run_wsd(cfg,args.config,trace=tr,skip_dolma_prep=bool(getattr(args,"skip_dolma_prep",False)))
         _print(rep)
         print("OK" if rep.get("ok") else "FAIL")
     finally:
@@ -384,6 +384,7 @@ def build_parser()->argparse.ArgumentParser:
     s.add_argument("--config",required=True)
     s.add_argument("--skip-preflight",action="store_true")
     s.add_argument("--no-archive",action="store_true")
+    s.add_argument("--skip-dolma-prep",action="store_true",help="Skip dolma prep/verify; assume tokenized files already exist")
     s.set_defaults(func=cmd_run_wsd)
     s=sub.add_parser("run-stage0-inline")
     s.add_argument("--config",required=True)

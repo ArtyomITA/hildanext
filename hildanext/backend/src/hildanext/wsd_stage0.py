@@ -379,6 +379,9 @@ def _build_tokenized_artifacts(cfg:AppConfig,train_tok_path:Path,eval_tok_path:P
     rows=0
     cur_tok=[]
     cur_doc=[]
+    t0_art=time.time()
+    total_input=sum(p.stat().st_size for p in [train_tok_path,eval_tok_path] if p.exists())
+    print(f"[artifacts] START  building .npy shards from {total_input//1024//1024} MB tokenized data  shard_rows={shard_rows}",flush=True)
     for p in [train_tok_path,eval_tok_path]:
         with p.open("r",encoding="utf-8",errors="ignore") as f:
             for line in f:
@@ -398,12 +401,15 @@ def _build_tokenized_artifacts(cfg:AppConfig,train_tok_path:Path,eval_tok_path:P
                     shard+=1
                     cur_tok=[]
                     cur_doc=[]
+                    if shard%10==0:
+                        print(f"[artifacts]   shard={shard}  rows={rows:,}  elapsed={int(time.time()-t0_art)}s",flush=True)
     if cur_tok:
         np.save(tok_dir/f"tokens_{shard:05d}.npy",np.asarray(cur_tok,dtype=np.uint32))
         np.save(doc_dir/f"doc_index_{shard:05d}.npy",np.asarray(cur_doc,dtype=np.int32))
         shard+=1
     meta={"seq_len":seq_len,"rows_total":rows,"shards":shard,"tokens_dir":str(tok_dir),"doc_index_dir":str(doc_dir)}
     write_json(base/"meta.json",meta)
+    print(f"[artifacts] DONE   shards={shard}  rows_total={rows:,}  elapsed={int(time.time()-t0_art)}s",flush=True)
     return meta
 
 def _dolma_fingerprint(cfg:AppConfig,manifest:Dict[str,Any])->Dict[str,Any]:
@@ -499,7 +505,35 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
     existing_doc_index=_inspect_existing_doc_index(source) if source.is_dir() else {"exists":False,"compatible":False,"reason":"source_not_dir"}
     ext_doc_dir=_resolve_external_doc_index_dir()
     ext_doc_info=_inspect_existing_doc_index(ext_doc_dir if ext_doc_dir.exists() else Path("__missing__"))
-    split=_split_processed(cfg,source_path=source,max_docs=int(cfg.data.max_samples),eval_pct=float(cfg.data.eval_pct_stage0),seed=99)
+    # Checkpoint 1: skip _split_processed if output already exists and is non-empty (resume after crash)
+    proc_dir=Path(cfg.paths.processed_dir)
+    proc_train=proc_dir/"train.jsonl"
+    proc_eval=proc_dir/"eval.jsonl"
+    _MIN_PROC_BYTES=1024*1024  # at least 1 MB to be considered valid
+    if proc_train.exists() and proc_eval.exists() and proc_train.stat().st_size>_MIN_PROC_BYTES and proc_eval.stat().st_size>_MIN_PROC_BYTES:
+        # Count lines with progress (36 GB file can take a few minutes)
+        def _count_lines_progress(p:Path,label:str)->int:
+            n=0
+            t0_c=time.time()
+            last_c=t0_c
+            sz=p.stat().st_size
+            print(f"[prep] counting lines in {label} ({sz//1024//1024} MB) ...",flush=True)
+            with p.open("r",encoding="utf-8",errors="ignore") as _f:
+                for _ in _f:
+                    n+=1
+                    now=time.time()
+                    if now-last_c>=15:
+                        print(f"[prep]   {label}: {n:,} lines so far  ({int(now-t0_c)}s)",flush=True)
+                        last_c=now
+            print(f"[prep] {label}: {n:,} lines total  ({int(time.time()-t0_c)}s)",flush=True)
+            return n
+        n_tr=_count_lines_progress(proc_train,"train")
+        n_ev=_count_lines_progress(proc_eval,"eval")
+        split={"train_path":str(proc_train),"eval_path":str(proc_eval),"num_docs_train":n_tr,"num_docs_eval":n_ev,"num_tokens_train_est":0,"num_tokens_eval_est":0,"skipped":True,"reason":"processed_already_exists"}
+        if tr is not None:
+            tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="split_processed_skip",reason="processed_already_exists",extra_dict={"train_rows":n_tr,"eval_rows":n_ev,"train_bytes":proc_train.stat().st_size})
+    else:
+        split=_split_processed(cfg,source_path=source,max_docs=int(cfg.data.max_samples),eval_pct=float(cfg.data.eval_pct_stage0),seed=99)
     if split["num_docs_train"]<=0:
         if tr is not None:
             tr.record_fallback(event="fallback",module="wsd_stage0",func="prepare_dolma_only",action="download_false_empty",reason="dataset_empty",extra_dict={"root_path":man["root_path"],"max_docs":cfg.data.max_samples})
@@ -507,8 +541,15 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
     tok_dir=ensure_dir(cfg.paths.tokenized_dir)
     train_tok=Path(tok_dir)/"train.jsonl"
     eval_tok=Path(tok_dir)/"eval.jsonl"
-    tok_train=tokenize_split(cfg,split["train_path"],str(train_tok),max_records=None,trace=tr)
-    tok_eval=tokenize_split(cfg,split["eval_path"],str(eval_tok),max_records=None,trace=tr)
+    # Checkpoint 2: skip tokenize_split if tokenized output already exists and is non-empty
+    if train_tok.exists() and eval_tok.exists() and train_tok.stat().st_size>_MIN_PROC_BYTES and eval_tok.stat().st_size>_MIN_PROC_BYTES:
+        tok_train={"input":split["train_path"],"output":str(train_tok),"records_in":split["num_docs_train"],"records_out":-1,"seq_len":int(cfg.data.seq_len),"skipped":True,"reason":"tokenized_already_exists"}
+        tok_eval={"input":split["eval_path"],"output":str(eval_tok),"records_in":split["num_docs_eval"],"records_out":-1,"seq_len":int(cfg.data.seq_len),"skipped":True,"reason":"tokenized_already_exists"}
+        if tr is not None:
+            tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="tokenize_skip",reason="tokenized_already_exists",extra_dict={"train_bytes":train_tok.stat().st_size})
+    else:
+        tok_train=tokenize_split(cfg,split["train_path"],str(train_tok),max_records=None,trace=tr)
+        tok_eval=tokenize_split(cfg,split["eval_path"],str(eval_tok),max_records=None,trace=tr)
     ext_apply={"path":str(ext_doc_dir),"rows_total":0,"rows_replaced":0,"mode":"internal_doc_ids"}
     if ext_doc_info.get("exists") and ext_doc_info.get("compatible"):
         ext_apply=_apply_external_doc_index(train_tok,eval_tok,doc_dir=ext_doc_dir,seq_len=int(cfg.data.seq_len))
@@ -680,21 +721,32 @@ def archive_runs(cfg:AppConfig,trace=None)->Dict[str,Any]:
     write_json(out,rep)
     return rep
 
-def run_wsd(cfg:AppConfig,config_path:str,trace=None)->Dict[str,Any]:
+def run_wsd(cfg:AppConfig,config_path:str,trace=None,skip_dolma_prep:bool=False)->Dict[str,Any]:
     tr=use_trace(cfg,trace)
     run_cfg=_apply_stage0_to_cfg(cfg,getattr(tr,"run_id",""))
     _ensure_llada21_objective(run_cfg)
-    verify_before=verify_dolma_only(run_cfg,trace=tr)
-    if verify_before.get("ok"):
-        prep={"skipped":True,"reason":"artifacts_ready"}
-        verify=verify_before
+    if skip_dolma_prep:
+        # Prep must have been done separately; just verify tokenized .jsonl exist.
+        train_tok=Path(run_cfg.paths.tokenized_dir)/"train.jsonl"
+        eval_tok=Path(run_cfg.paths.tokenized_dir)/"eval.jsonl"
+        if not train_tok.exists() or not eval_tok.exists():
+            raise RuntimeError(f"skip_dolma_prep_set_but_tokenized_missing paths={train_tok},{eval_tok}")
+        prep={"skipped":True,"reason":"skip_dolma_prep_flag"}
+        verify={"ok":True,"skipped":True,"reason":"skip_dolma_prep_flag"}
         if tr is not None:
-            tr.record_notice(module="wsd_stage0",func="run_wsd",action="prepare_dolma_skip",reason="artifacts_ready")
+            tr.record_notice(module="wsd_stage0",func="run_wsd",action="prepare_dolma_skip",reason="skip_dolma_prep_flag",extra_dict={"train_tok":str(train_tok),"eval_tok":str(eval_tok)})
     else:
-        prep=prepare_dolma_only(run_cfg,trace=tr)
-        verify=verify_dolma_only(run_cfg,trace=tr)
-    if not verify.get("ok"):
-        raise RuntimeError("dolma_verify_failed")
+        verify_before=verify_dolma_only(run_cfg,trace=tr)
+        if verify_before.get("ok"):
+            prep={"skipped":True,"reason":"artifacts_ready"}
+            verify=verify_before
+            if tr is not None:
+                tr.record_notice(module="wsd_stage0",func="run_wsd",action="prepare_dolma_skip",reason="artifacts_ready")
+        else:
+            prep=prepare_dolma_only(run_cfg,trace=tr)
+            verify=verify_dolma_only(run_cfg,trace=tr)
+        if not verify.get("ok"):
+            raise RuntimeError("dolma_verify_failed")
     summary=run_wsd_conversion(run_cfg,steps=int(run_cfg.stage0.steps_total_stage0),trace=tr,resume=True,ckpt_every=int(run_cfg.stage0.save_every_steps),eval_every=max(1,int(run_cfg.stage0.eval_every_steps) if int(run_cfg.stage0.eval_every_steps)>0 else int(run_cfg.stage0.steps_total_stage0)+1))
     ck_root=Path(summary["checkpoints_dir"])
     ckpts=[str(x) for x in sorted(ck_root.glob("step_*"))]
