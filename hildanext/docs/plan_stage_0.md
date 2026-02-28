@@ -1,5 +1,7 @@
-RUOLO
-Sei Codex GPT-5.3 in VSCode. Agisci come AI/LLM Engineer + Backend Engineer.
+# plan_stage_0 — ARCHIVIATO
+
+Questo file era il prompt/task originale (2026-02-22) usato per scaffoldare il backend.
+Non è più un documento vivo. Riferirsi a `DESIGN.md` per lo stato attuale del progetto.
 Obiettivo: creare un backend completo e riproducibile in una nuova cartella /hildanext, che:
 
 1) integra Qwen3-0.6B (weights/tokenizer locali in formato HF, es. model.safetensors + tokenizer.json ecc.)

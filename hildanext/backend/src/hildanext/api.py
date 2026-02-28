@@ -20,6 +20,7 @@ class GenerateRequest(BaseModel):
     tau_edit:Optional[float]=None
     max_new_tokens:int=Field(default=96,ge=1,le=4096)
     seed:Optional[int]=None
+    effort:str=Field(default="medium",description="instant|low|medium|high|adaptive — controls decode steps and tau scaling")
 
 class GenerateResponse(BaseModel):
     text:str
@@ -69,7 +70,8 @@ def create_app(cfg:AppConfig)->FastAPI:
                 tau_mask=req.tau_mask,
                 tau_edit=req.tau_edit,
                 max_new_tokens=req.max_new_tokens,
-                seed=req.seed
+                seed=req.seed,
+                effort=req.effort
             )
             st=dict(getattr(engine,"last_stats",{}) or {})
             st["fallbacks"]=tr.snapshot_fallbacks(limit=128)
@@ -96,7 +98,8 @@ def create_app(cfg:AppConfig)->FastAPI:
                 tau_mask=req.tau_mask,
                 tau_edit=req.tau_edit,
                 max_new_tokens=req.max_new_tokens,
-                seed=req.seed
+                seed=req.seed,
+                effort=req.effort
             )
             st=dict(getattr(engine,"last_stats",{}) or {})
             st["fallbacks"]=tr.snapshot_fallbacks(limit=128)

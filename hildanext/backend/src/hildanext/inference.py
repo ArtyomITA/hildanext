@@ -166,6 +166,30 @@ def load_model_bundle(cfg:AppConfig,for_training:bool=False,trace=None)->ModelBu
         fallbacks=tr.snapshot_fallbacks(limit=64) if tr is not None else []
     )
 
+# --- P0.2 effort knob ---
+_EFFORT_PARAMS:Dict[str,Dict[str,Any]]={
+    "instant": {"max_steps":1,   "tau_scale":2.0},
+    "low":     {"max_steps":3,   "tau_scale":1.5},
+    "medium":  {"max_steps":None,"tau_scale":1.0},
+    "high":    {"max_steps":20,  "tau_scale":0.7},
+    "adaptive":{"max_steps":128, "tau_scale":1.0},
+}
+
+def _resolve_effort(effort:str,cfg_steps:int,tau_mask:float,tau_edit:float)->Tuple[int,float,float]:
+    """Map effort level → (steps, tau_mask, tau_edit).
+    'adaptive' = run until mask_ratio==0, up to 128 steps.
+    tau is clamped to [0, 1].
+    """
+    p=_EFFORT_PARAMS.get(str(effort).lower(),_EFFORT_PARAMS["medium"])
+    steps=p["max_steps"] if p["max_steps"] is not None else cfg_steps
+    scale=float(p["tau_scale"])
+    return (
+        max(1,int(steps)),
+        min(1.0,max(0.0,tau_mask*scale)),
+        min(1.0,max(0.0,tau_edit*scale)),
+    )
+
+
 def mode_thresholds(cfg:AppConfig,mode:str,tau_mask:Optional[float],tau_edit:Optional[float])->Tuple[float,float]:
     m=(mode or "S_MODE").upper()
     if tau_mask is not None and tau_edit is not None:
@@ -215,7 +239,7 @@ class BaseEngine:
         self.cfg=cfg
         self.trace=use_trace(cfg,trace)
         self.last_stats:Dict[str,Any]={}
-    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None)->str:
+    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None,effort:str="medium")->str:
         raise NotImplementedError
     def close(self)->None:
         return
@@ -226,12 +250,14 @@ class TransformersEngine(BaseEngine):
         super().__init__(cfg,trace=trace)
         self.bundle=load_model_bundle(cfg,for_training=False,trace=self.trace)
         self.fallback_reason=fallback_reason or self.bundle.load_reason
-    def _decode(self,prompt:str,mode:str,tau_mask:float|None,tau_edit:float|None,max_new_tokens:int|None,seed:int|None)->str:
+    def _decode(self,prompt:str,mode:str,tau_mask:float|None,tau_edit:float|None,max_new_tokens:int|None,seed:int|None,effort:str="medium")->str:
         if seed is None:
             seed=self.cfg.runtime.seed
         seed_everything(seed)
         tau_m,tau_e=mode_thresholds(self.cfg,mode,tau_mask,tau_edit)
         max_new=max(1,int(max_new_tokens or self.cfg.inference.max_new_tokens))
+        # apply effort knob (overrides steps and scales tau)
+        eff_steps,tau_m,tau_e=_resolve_effort(effort,max(1,int(self.cfg.inference.max_steps)),tau_m,tau_e)
         tok=self.bundle.tokenizer
         model=self.bundle.model
         device=self.bundle.device
@@ -249,6 +275,7 @@ class TransformersEngine(BaseEngine):
         patience=max(1,int(self.cfg.inference.degenerate_patience))
         strict=bool(self.cfg.inference.strict_decode_invariants)
         allow_fallback=bool(self.cfg.inference.allow_tau_fallback_on_degenerate)
+        steps=eff_steps  # effort-resolved step budget overrides config
         with torch.no_grad():
             for step in range(steps):
                 gen_before=seq[:,prompt_len:]
@@ -305,11 +332,15 @@ class TransformersEngine(BaseEngine):
                         self.last_stats={
                             "engine":self.name,
                             "mode":mode,
+                            "effort":effort,
                             "tau_mask":tau_m,
                             "tau_edit":tau_e,
                             "steps":len(logs),
+                            "steps_to_converge":len(logs),
                             "logs":logs,
                             "tokens_per_sec":tokens_per_second(int(max_new),elapsed),
+                            "vram_peak_bytes":None,
+                            "json_valid_rate":None,
                             "fallback_reason":self.fallback_reason,
                             "dummy_model":self.bundle.is_dummy,
                             "load_reason":self.bundle.load_reason,
@@ -323,14 +354,26 @@ class TransformersEngine(BaseEngine):
         elapsed=max(1e-6,time.time()-t0)
         out_ids=seq[0,prompt_len:]
         text=_decode_text(tok,out_ids,mask_id,self.bundle.is_dummy)
+        # P0.3 metrics
+        stc=next((l["step"] for l in logs if l.get("mask_ratio",1.0)==0.0),len(logs))
+        vram_peak=None
+        if self.bundle.device.type=="cuda":
+            try:
+                vram_peak=float(torch.cuda.max_memory_allocated(self.bundle.device.index or 0))
+            except Exception:
+                pass
         self.last_stats={
             "engine":self.name,
             "mode":mode,
+            "effort":effort,
             "tau_mask":tau_m,
             "tau_edit":tau_e,
             "steps":len(logs),
+            "steps_to_converge":stc,
             "logs":logs,
             "tokens_per_sec":tokens_per_second(int(max_new),elapsed),
+            "vram_peak_bytes":vram_peak,
+            "json_valid_rate":None,
             "fallback_reason":self.fallback_reason,
             "dummy_model":self.bundle.is_dummy,
             "load_reason":self.bundle.load_reason,
@@ -341,8 +384,8 @@ class TransformersEngine(BaseEngine):
             "fallbacks":self.trace.snapshot_fallbacks(limit=64) if self.trace is not None else []
         }
         return text.strip()
-    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None)->str:
-        return self._decode(prompt,mode,tau_mask,tau_edit,max_new_tokens,seed)
+    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None,effort:str="medium")->str:
+        return self._decode(prompt,mode,tau_mask,tau_edit,max_new_tokens,seed,effort=effort)
 
 class DInferEngine(BaseEngine):
     name="dinfer"
@@ -391,8 +434,9 @@ class DInferEngine(BaseEngine):
                 self.server.stop_serving()
         except Exception:
             pass
-    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None)->str:
+    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None,effort:str="medium")->str:
         tau_m,_=mode_thresholds(self.cfg,mode,tau_mask,tau_edit)
+        eff_steps,tau_m,_=_resolve_effort(effort,8,tau_m,tau_m)
         if hasattr(self.server,"sample_params"):
             try:
                 self.server.sample_params.threshold=float(tau_m)
@@ -407,7 +451,7 @@ class DInferEngine(BaseEngine):
         text=self.tokenizer.decode(out[0,prompt_len:],skip_special_tokens=True)
         if not text.strip():
             text="[DUMMY] dummy-output"
-        self.last_stats={"engine":self.name,"mode":mode,"tau_mask":tau_m,"tau_edit":tau_edit,"steps":-1,"tokens_per_sec":tokens_per_second(int(max_new),elapsed),"fallbacks":self.trace.snapshot_fallbacks(limit=64) if self.trace is not None else []}
+        self.last_stats={"engine":self.name,"mode":mode,"effort":effort,"tau_mask":tau_m,"tau_edit":tau_mask,"steps":-1,"steps_to_converge":None,"tokens_per_sec":tokens_per_second(int(max_new),elapsed),"vram_peak_bytes":None,"json_valid_rate":None,"fallbacks":self.trace.snapshot_fallbacks(limit=64) if self.trace is not None else []}
         return text.strip()
 
 def build_engine(cfg:AppConfig,trace=None)->BaseEngine:

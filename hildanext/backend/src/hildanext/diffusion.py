@@ -135,7 +135,11 @@ def compute_m2t_t2t_losses(model,input_ids:torch.Tensor,attention_mask:torch.Ten
         t2t_losses.append(_causal_loss(out_t2t.logits,t2t_y))
     loss_t2t=torch.stack(t2t_losses).mean()
     loss=cfg.m2t_weight*loss_m2t+cfg.t2t_weight*loss_t2t
-    return {"loss":loss,"loss_m2t":loss_m2t.detach(),"loss_t2t":loss_t2t.detach()}
+    with torch.no_grad():
+        preds=out_m2t.logits.argmax(-1)
+        mask_pos=m2t_y.ne(-100)
+        masked_token_acc=float((preds[mask_pos]==m2t_y[mask_pos]).float().mean().item()) if mask_pos.any() else None
+    return {"loss":loss,"loss_m2t":loss_m2t.detach(),"loss_t2t":loss_t2t.detach(),"masked_token_acc":masked_token_acc}
 
 def apply_remask(tokens:torch.Tensor,confidence:torch.Tensor,mask_id:int,cfg:RemaskConfig)->torch.Tensor:
     x=tokens.clone()

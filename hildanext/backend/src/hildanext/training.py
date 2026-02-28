@@ -375,6 +375,8 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     "loss":last_loss,
                     "loss_m2t":float(out["loss_m2t"].item()),
                     "loss_t2t":float(out["loss_t2t"].item()),
+                    "masked_token_acc":out.get("masked_token_acc"),
+                    "json_valid_rate":None,
                     "lr":float(cfg.train.lr),
                     "tokens_per_sec":tokens_per_second(token_seen,elapsed),
                     "mem":mem_stats(bundle.device),
@@ -389,7 +391,9 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 append_jsonl(log_path,[row])
                 if opt_steps==1 or opt_steps%log_every==0 or opt_steps==max_steps:
                     ts=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime())
-                    print(f"{ts} stage={row['stage']} step={row['step_current']}/{row['steps_total']} phase={row['phase']} block={row['block_size']} loss={row['loss']:.6f} tok_seen={row['tokens_seen_total']} sec_step={row['sec_per_step_avg']:.3f} eta_sec={row['eta_stage_sec']:.1f} peak_vram={row['peak_vram_bytes']}",flush=True)
+                    mta=row['masked_token_acc']
+                    mta_s=f"{mta:.4f}" if mta is not None else "n/a"
+                    print(f"{ts} stage={row['stage']} step={row['step_current']}/{row['steps_total']} phase={row['phase']} block={row['block_size']} loss={row['loss']:.6f} mta={mta_s} tok_seen={row['tokens_seen_total']} sec_step={row['sec_per_step_avg']:.3f} eta_sec={row['eta_stage_sec']:.1f} peak_vram={row['peak_vram_bytes']}",flush=True)
                 if tr is not None:
                     tr.record_metric(name=f"{kind}.loss_total",value=last_loss,step=opt_steps,module="training",func="_run")
                     tr.record_metric(name=f"{kind}.loss_m2t",value=float(out["loss_m2t"].item()),step=opt_steps,module="training",func="_run")
@@ -399,6 +403,9 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     _prune_checkpoints(Path(ckpt_dir),keep_last)
                 if opt_steps%eval_every==0 or opt_steps==max_steps:
                     ev=_periodic_eval(model,bundle.tokenizer,bundle.device,bundle.mask_id,cfg,seed=cfg.runtime.seed+opt_steps)
+                    # P0.3: compute steps_to_converge per prompt, then average
+                    stc_vals=[next((l["step"] for l in r.get("decode_logs",[]) if l.get("mask_ratio",1.0)==0.0),len(r.get("decode_logs",[]))) for r in ev.get("rows",[])]
+                    ev["avg_steps_to_converge"]=sum(stc_vals)/len(stc_vals) if stc_vals else None
                     ev["kind"]=kind
                     ev["step"]=opt_steps
                     append_jsonl(eval_path,[ev])

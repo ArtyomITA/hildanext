@@ -162,6 +162,22 @@ class RuntimeConfig:
     oom_policy:str="downscale_seq_then_accum"
 
 @dataclass
+class ExperimentConfig:
+    """Ablation-control flags. Set under the 'experiment' key in your config JSON.
+    Each field maps to a distinct design choice so runs are reproducible and comparable.
+    """
+    # P0.1 flags
+    mask_strategy:str="special_mask_token"    # special_mask_token | repurpose_rare_token
+    attention_mode:str="bidirectional_always"  # bidirectional_always | bidirectional_only_stable
+    time_param:str="discrete"                  # discrete | continuous_time
+    loss_weighting:str="none"                  # none | inv_t
+    shift_mode:str="preserve_left_shift"       # preserve_left_shift | bos_and_shift
+    effort:str="medium"                        # instant | low | medium | high | adaptive
+    # annotation
+    experiment_id:str=""                       # short tag e.g. "exp01_inv_t"
+    notes:str=""                               # free-text, written into run summary JSON
+
+@dataclass
 class AppConfig:
     paths:PathsConfig=field(default_factory=PathsConfig)
     data:DataConfig=field(default_factory=DataConfig)
@@ -173,6 +189,7 @@ class AppConfig:
     recipe:RecipeConfig=field(default_factory=RecipeConfig)
     inference:InferenceConfig=field(default_factory=InferenceConfig)
     runtime:RuntimeConfig=field(default_factory=RuntimeConfig)
+    experiment:ExperimentConfig=field(default_factory=ExperimentConfig)
 
 def _merge_dataclass(dc:Any,payload:Dict[str,Any])->Any:
     for k,v in payload.items():

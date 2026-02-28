@@ -1,4 +1,34 @@
 # Test Output
+Last full run: 2026-02-22 04:04:55 +01:00
+Status: **parzialmente obsoleto** — vedi nota aggiornamento 2026-02-28.
+
+---
+
+## Nota aggiornamento 2026-02-28
+
+Il codice ha ricevuto modifiche che cambiano le signature di ritorno di alcuni moduli:
+- `compute_m2t_t2t_losses` ora ritorna `masked_token_acc` in aggiunta a `loss/loss_m2t/loss_t2t`.
+- `tokenize_split` è stato riscritto (streaming + checkpoint/resume + batch encoding).
+- `_run` in training.py loga `masked_token_acc` e `json_valid_rate`.
+- `AppConfig` ha il nuovo campo `experiment:ExperimentConfig`.
+
+I test unitari in `test/` testano su dummy model e non dipendono da questi campi,
+quindi il risultato del Feb 22 è ancora valido come indicatore smoke.
+Per rieseguire i test:
+```
+cd hildanext\backend
+C:\Users\Administrator\.conda\envs\mdm\python.exe e:\DIFFUSION\HildaNext\hildanext\test\run_tests.py
+```
+
+---
+
+## Run 2026-02-22 — risultati originali
+
+### Command 1
+```
+python e:\DIFFUSION\HildaNext\hildanext\test\run_tests.py
+Exit code: 0
+```
 Generated: 2026-02-22 04:04:55 +01:00
 
 ## Command 1

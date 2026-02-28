@@ -1,9 +1,10 @@
 # Python Inventory
 Scope: `hildanext/backend/src/hildanext`, `hildanext/backend/tests`, `hildanext/test`.
 Vendor included: no.
+Ultimo aggiornamento: 2026-02-28
 
 ## Cartelle
-- `backend\src\hildanext`: 17 file Python
+- `backend\src\hildanext`: 18 file Python
 - `backend\tests`: 1 file Python
 - `test`: 9 file Python
 
@@ -21,7 +22,7 @@ Vendor included: no.
   - `run_server(config_path:str, host:str='127.0.0.1', port:int=8080) -> None`
     Descrizione: Esegue pipeline o job completo.
   Classi:
-  - `GenerateRequest`
+  - `GenerateRequest` *(aggiornato 2026-02-28: campo `effort:str="medium"`)*
   - `GenerateResponse`
   - `JobResponse`
 
@@ -93,13 +94,17 @@ Vendor included: no.
   Classi:
   - `PathsConfig`
   - `DataConfig`
+  - `LLaDA2Config`
   - `ModelConfig`
   - `WSDConfig`
   - `TrainConfig`
+  - `Stage0Config`
+  - `RecipeConfig`
   - `RemaskConfig`
   - `InferenceConfig`
   - `RuntimeConfig`
-  - `AppConfig`
+  - `ExperimentConfig` *(NUOVO 2026-02-28 — ablation flags: mask_strategy, attention_mode, time_param, loss_weighting, shift_mode, effort, experiment_id, notes)*
+  - `AppConfig` *(aggiornato: campo `experiment:ExperimentConfig`)*
 
 - File: `backend\src\hildanext\datasets.py`
   Logica d'uso: Builds CPT/SFT datasets from local/raw sources with fallback-safe behavior.
@@ -147,7 +152,7 @@ Vendor included: no.
   - `_make_t2t_batch(input_ids:torch.Tensor, attn_mask:torch.Tensor, response_mask:torch.Tensor | None, ratio:float, vocab_size:int) -> Tuple[torch.Tensor, torch.Tensor]`
     Descrizione: Funzione di utilita' usata nel flusso SAFE.
   - `compute_m2t_t2t_losses(model:Any, input_ids:torch.Tensor, attention_mask:torch.Tensor, doc_ids:torch.Tensor, response_mask:torch.Tensor | None, mask_id:int, vocab_size:int, cfg:TrainConfig, focus_response:bool) -> Dict[str, torch.Tensor]`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
+    Descrizione: Funzione di utilita' usata nel flusso SAFE. *(aggiornato 2026-02-28: return include `masked_token_acc`)*
   - `apply_remask(tokens:torch.Tensor, confidence:torch.Tensor, mask_id:int, cfg:RemaskConfig) -> torch.Tensor`
     Descrizione: Gestisce logica di mascheratura/filtri di posizioni.
   Classi:
@@ -169,9 +174,13 @@ Vendor included: no.
 
 - File: `backend\src\hildanext\inference.py`
   Logica d'uso: Builds dInfer/fallback engines and threshold-edit decode.
+  Modulo-level:
+  - `_EFFORT_PARAMS: Dict` *(NUOVO 2026-02-28)* — mappa effort→steps/tau_scale
   Funzioni:
   - `load_model_bundle(cfg:AppConfig, for_training:bool=False) -> ModelBundle`
     Descrizione: Carica dati o stato da sorgente esterna/file.
+  - `_resolve_effort(effort:str, cfg_steps:int, tau_mask:float, tau_edit:float) -> Tuple[int, float, float]` *(NUOVO 2026-02-28)*
+    Descrizione: Mappa effort level → (steps, tau_mask, tau_edit).
   - `mode_thresholds(cfg:AppConfig, mode:str, tau_mask:Optional[float], tau_edit:Optional[float]) -> Tuple[float, float]`
     Descrizione: Funzione di utilita' usata nel flusso SAFE.
   - `build_engine(cfg:AppConfig) -> BaseEngine`
@@ -179,28 +188,14 @@ Vendor included: no.
   Classi:
   - `ModelBundle`
   - `BaseEngine`
-    Metodo: `__init__(self:Any, cfg:AppConfig) -> Any`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
-    Metodo: `generate(self:Any, prompt:str, mode:str='S_MODE', tau_mask:float | None=None, tau_edit:float | None=None, max_new_tokens:int | None=None, seed:int | None=None) -> str`
+    Metodo: `generate(self, prompt, mode, tau_mask, tau_edit, max_new_tokens, seed, effort='medium') -> str` *(effort aggiunto 2026-02-28)*
     Descrizione: Genera output testo o sequenze.
-    Metodo: `close(self:Any) -> None`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
-  - `TransformersEngine`
-    Metodo: `__init__(self:Any, cfg:AppConfig, fallback_reason:str='') -> Any`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
-    Metodo: `_decode(self:Any, prompt:str, mode:str, tau_mask:float | None, tau_edit:float | None, max_new_tokens:int | None, seed:int | None) -> str`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
-    Metodo: `generate(self:Any, prompt:str, mode:str='S_MODE', tau_mask:float | None=None, tau_edit:float | None=None, max_new_tokens:int | None=None, seed:int | None=None) -> str`
-    Descrizione: Genera output testo o sequenze.
-  - `DInferEngine`
-    Metodo: `__init__(self:Any, cfg:AppConfig) -> Any`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
-    Metodo: `_init_server(self:Any) -> None`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
-    Metodo: `close(self:Any) -> None`
-    Descrizione: Funzione di utilita' usata nel flusso SAFE.
-    Metodo: `generate(self:Any, prompt:str, mode:str='S_MODE', tau_mask:float | None=None, tau_edit:float | None=None, max_new_tokens:int | None=None, seed:int | None=None) -> str`
-    Descrizione: Genera output testo o sequenze.
+  - `TransformersEngine` *(aggiornato 2026-02-28)*
+    Metodo: `_decode(self, ..., effort='medium') -> str`
+    Metodo: `generate(self, ..., effort='medium') -> str`
+    Note: `last_stats` include `steps_to_converge`, `vram_peak_bytes`, `json_valid_rate`.
+  - `DInferEngine` *(aggiornato 2026-02-28)*
+    Metodo: `generate(self, ..., effort='medium') -> str`
 
 - File: `backend\src\hildanext\io.py`
   Logica d'uso: Thin IO alias module.
@@ -253,10 +248,14 @@ Vendor included: no.
     Descrizione: Funzione di utilita' usata nel flusso SAFE.
   - `_encode_record(tokenizer:Any, record:Dict[str, Any], vocab_size:int) -> Tuple[List[int], List[int], str]`
     Descrizione: Funzione di utilita' usata nel flusso SAFE.
+  - `_encode_records_batch(tokenizer:Any, records:List[Dict], vocab_size:int) -> List[Tuple]` *(NUOVO 2026-02-28)*
+    Descrizione: Batch encoding via backend Rust (5-8x speedup vs per-record).
   - `_pack(encoded:List[Tuple[List[int], List[int], str]], seq_len:int, pad_id:int, eos_id:int) -> List[Dict[str, Any]]`
     Descrizione: Funzione di utilita' usata nel flusso SAFE.
-  - `tokenize_split(cfg:AppConfig, input_path:str, output_path:str, max_records:int | None=None) -> Dict[str, Any]`
-    Descrizione: Gestisce tokenizzazione o manipolazione token.
+  - `_pack_streaming(encoded, seq_len, pad_id, eos_id, carry_ids, carry_docs, carry_resp, carry_src, doc_offset, trunc_prob=0.0) -> Tuple[List, ...]` *(NUOVO 2026-02-28)*
+    Descrizione: Streaming carry-over packing con random-length truncation.
+  - `tokenize_split(cfg:AppConfig, input_path:str, output_path:str, max_records:int|None=None) -> Dict[str, Any]` *(riscritto 2026-02-28)*
+    Descrizione: Streaming/chunk (CHUNK_ROWS=5000), batch encoding, checkpoint/resume ogni 50k righe, TRUNC_PROB=0.01.
   - `tokenize_all(cfg:AppConfig, max_records:int | None=None) -> Dict[str, Any]`
     Descrizione: Gestisce tokenizzazione o manipolazione token.
 
@@ -416,3 +415,12 @@ Vendor included: no.
     Descrizione: Test automatico di regressione/comportamento.
     Metodo: `test_local_tokenizer_mask(self:Any) -> Any`
     Descrizione: Test automatico di regressione/comportamento.
+
+### `scripts\`
+- File: `scripts\make_resume_ckpt.py` *(NUOVO 2026-02-28)*
+  Logica d'uso: Bootstrap checkpoint resume da run tokenize interrotta.
+  Conta righe in `data/tokenized/train.jsonl`, tronca al chunk boundary (5000 rows),
+  scrive `.ckpt` JSON per `tokenize_split`. Eseguire da root `hildanext/`.
+
+- File: `scripts\run_wsd_overnight.ps1` — overnight WSD runner
+- File: `scripts\reset_and_download_dolma.ps1` — reset dataset
