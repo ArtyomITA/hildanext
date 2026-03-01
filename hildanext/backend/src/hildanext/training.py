@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any,Dict,List,Optional,Tuple
 import json
+import logging
 import time
 import math
 import torch
@@ -18,6 +19,21 @@ from .tokenization import ensure_mask_token
 from .formulas import llada21_apply
 from .utils import mem_stats,tokens_per_second,seed_everything
 from .trace import use_trace,exception_with_stack
+
+def _compute_lr(step:int,warmup_steps:int,total_steps:int,base_lr:float,min_ratio:float=0.1)->float:
+    """Linear warmup then cosine decay to base_lr*min_ratio."""
+    if step<warmup_steps:
+        return base_lr*float(step)/max(1,warmup_steps)
+    progress=float(step-warmup_steps)/max(1,total_steps-warmup_steps)
+    return base_lr*(min_ratio+(1-min_ratio)*0.5*(1+math.cos(math.pi*progress)))
+
+def _t_bucket_key(t:float)->str:
+    if t<0.1: return "0.0-0.1"
+    if t<0.3: return "0.1-0.3"
+    if t<0.6: return "0.3-0.6"
+    return "0.6-1.0"
+
+_T_BUCKET_NAMES=["0.0-0.1","0.1-0.3","0.3-0.6","0.6-1.0"]
 
 class TokenizedDataset(Dataset):
     def __init__(self,path:str,max_rows:int|None=None):
@@ -261,6 +277,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     max_steps=max(1,int(steps))
     log_path=Path(cfg.paths.logs_dir)/f"{kind}.jsonl"
     eval_path=Path(cfg.paths.logs_dir)/f"{kind}.eval.jsonl"
+    run_log_path=Path(cfg.paths.logs_dir)/f"{kind}_run.log"
     ckpt_dir=ensure_dir(cfg.paths.checkpoints_dir)/kind
     ckpt_every=max(1,int(ckpt_every or cfg.train.ckpt_every))
     eval_every=max(1,int(eval_every or cfg.train.eval_every))
@@ -268,6 +285,33 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     keep_last=max(1,int(getattr(cfg.train,"keep_last_checkpoints",3) or 3))
     cooldown_every=max(0,int(getattr(cfg.train,"cooldown_every_steps",0) or 0))
     cooldown_seconds=max(0,int(getattr(cfg.train,"cooldown_seconds",0) or 0))
+    grad_clip_val=float(getattr(cfg.train,"grad_clip",1.0) or 1.0)
+    lr_base=float(cfg.train.lr)
+    lr_warmup=max(1,int(cfg.train.warmup_steps))
+    lr_min_ratio=float(getattr(cfg.train,"lr_min_ratio",0.1) or 0.1)
+    # Experiment flags
+    exp=cfg.experiment if hasattr(cfg,"experiment") else None
+    attn_mode=getattr(exp,"attention_mode","bidirectional_only_stable") if exp else "bidirectional_only_stable"
+    time_param=getattr(exp,"time_param","continuous_time") if exp else "continuous_time"
+    loss_weighting=getattr(exp,"loss_weighting","inv_t") if exp else "inv_t"
+    shift_mode=getattr(exp,"shift_mode","preserve_left_shift") if exp else "preserve_left_shift"
+    ct_t_min=float(getattr(exp,"t_min",0.001)) if exp else 0.001
+    ct_t_max=float(getattr(exp,"t_max",1.0)) if exp else 1.0
+    # File logger (dual: console + file)
+    run_log_path.parent.mkdir(parents=True,exist_ok=True)
+    _run_log_fh=open(run_log_path,"a",encoding="utf-8")
+    def _log(msg:str):
+        ts=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime())
+        line=f"[{ts}] {msg}"
+        print(line,flush=True)
+        _run_log_fh.write(line+"\n")
+        _run_log_fh.flush()
+    # T-bucket aggregators for continuous-time diagnostics
+    t_bucket_loss={k:{"sum":0.0,"count":0} for k in _T_BUCKET_NAMES}
+    t_bucket_acc={k:{"sum":0.0,"count":0} for k in _T_BUCKET_NAMES}
+    t_agg={"sum":0.0,"min":1.0,"max":0.0,"count":0}
+    nan_inf_count=0
+    last_phase=""
     t0=time.time()
     t_last=t0
     sec_roll=None
@@ -287,6 +331,16 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     oom_happened=False
     nan_happened=False
     epoch=0
+    # --- One-time start-of-run log ---
+    _log(f"RUN_START kind={kind} max_steps={max_steps} grad_acc={grad_acc} seq_len={cfg.data.seq_len} batch_size={cfg.train.batch_size}")
+    _log(f"  optimizer={opt_name} lr={lr_base} lr_warmup={lr_warmup} lr_min_ratio={lr_min_ratio} grad_clip={grad_clip_val} wd={cfg.train.weight_decay}")
+    _log(f"  shift_mode={shift_mode} time_param={time_param} loss_weighting={loss_weighting} attention_mode={attn_mode}")
+    _log(f"  t_min={ct_t_min} t_max={ct_t_max} mask_ratio_discrete={cfg.train.mask_ratio}")
+    _log(f"  model={bundle.model_name_or_path} dtype={bundle.actual_dtype} device={bundle.device} dummy={bundle.is_dummy}")
+    _log(f"  labels_offset=+1 first_position_ignored=True shift_mode={shift_mode}")
+    _log(f"  attention_backend=math_sdpa (force_math_sdpa active)")
+    if resumed_from:
+        _log(f"  resumed_from={resumed_from} opt_steps={opt_steps}")
     while opt_steps<max_steps:
         epoch+=1
         step_base=(epoch-1)*max(1,len(loader))
@@ -294,6 +348,18 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             if opt_steps>=max_steps:
                 break
             phase=wsd_block(opt_steps,cfg.wsd,seq_len=cfg.data.seq_len) if kind=="cpt" else wsd_block(cfg.wsd.warmup_steps+cfg.wsd.stable_steps,cfg.wsd,seq_len=cfg.data.seq_len)
+            # S0-A: determine bidirectional attention per WSD phase
+            if attn_mode=="bidirectional_always":
+                bidirectional=True
+            elif attn_mode=="bidirectional_only_stable":
+                bidirectional=(phase.phase=="stable")
+            else:
+                bidirectional=False
+            # Log phase transitions
+            if phase.phase!=last_phase:
+                total_wsd=cfg.wsd.warmup_steps+cfg.wsd.stable_steps+cfg.wsd.decay_steps
+                _log(f"PHASE_CHANGE wsd_phase={phase.phase} block_size={phase.block_size} bidirectional={bidirectional} is_causal_effective={not bidirectional} step={opt_steps}/{max_steps}")
+                last_phase=phase.phase
             batch={k:v.to(bundle.device,non_blocking=pin_memory) for k,v in batch.items()}
             vocab_cap=max(8,bundle.vocab_size)
             batch["input_ids"]=torch.remainder(batch["input_ids"],vocab_cap)
@@ -313,7 +379,12 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     mask_mode=run_mask_mode,
                     composite_block_size=cfg.llada2.composite_block_size,
                     trace=tr,
-                    cfg_obj=cfg
+                    cfg_obj=cfg,
+                    bidirectional=bidirectional,
+                    time_param=time_param,
+                    loss_weighting=loss_weighting,
+                    t_min=ct_t_min,
+                    t_max=ct_t_max
                 )
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -347,11 +418,29 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             loss=raw_loss/float(grad_acc)
             loss.backward()
             if step%grad_acc==0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
+                grad_norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),grad_clip_val))
+                clip_applied=bool(grad_norm>grad_clip_val)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 opt_steps+=1
+                # LR schedule: linear warmup + cosine decay
+                current_lr=_compute_lr(opt_steps,lr_warmup,max_steps,lr_base,lr_min_ratio)
+                for pg in opt.param_groups:
+                    pg["lr"]=current_lr
                 last_loss=float(raw_loss.detach().item())
+                # T-bucket aggregation
+                t_val=float(out.get("t_sampled",cfg.train.mask_ratio))
+                bk=_t_bucket_key(t_val)
+                t_bucket_loss[bk]["sum"]+=last_loss
+                t_bucket_loss[bk]["count"]+=1
+                mta_v=out.get("masked_token_acc")
+                if mta_v is not None:
+                    t_bucket_acc[bk]["sum"]+=mta_v
+                    t_bucket_acc[bk]["count"]+=1
+                t_agg["sum"]+=t_val
+                t_agg["min"]=min(t_agg["min"],t_val)
+                t_agg["max"]=max(t_agg["max"],t_val)
+                t_agg["count"]+=1
                 elapsed=max(1e-6,time.time()-t0)
                 t_now=time.time()
                 sec_step=max(1e-6,t_now-t_last)
@@ -360,12 +449,35 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 remain=max(0,max_steps-opt_steps)
                 eta=float(remain*(sec_roll or sec_step))
                 peak_vram=None
+                vram_alloc_mb=0.0
+                vram_reserved_mb=0.0
+                vram_peak_mb=0.0
                 if bundle.device.type=="cuda":
                     try:
-                        peak_vram=float(torch.cuda.max_memory_allocated(bundle.device.index or 0))
+                        dev_idx=bundle.device.index or 0
+                        peak_vram=float(torch.cuda.max_memory_allocated(dev_idx))
+                        vram_alloc_mb=float(torch.cuda.memory_allocated(dev_idx))/1024/1024
+                        vram_reserved_mb=float(torch.cuda.memory_reserved(dev_idx))/1024/1024
+                        vram_peak_mb=peak_vram/1024/1024
                     except Exception:
-                        peak_vram=None
+                        pass
                 tok_est=int(cfg.train.batch_size)*int(cfg.train.accum_steps)*int(cfg.data.seq_len)*int(opt_steps)
+                tok_per_sec=tokens_per_second(token_seen,elapsed)
+                # WSD phase progress
+                w_total=cfg.wsd.warmup_steps+cfg.wsd.stable_steps+cfg.wsd.decay_steps
+                if phase.phase=="warmup":
+                    phase_progress=float(opt_steps)/max(1,cfg.wsd.warmup_steps)
+                elif phase.phase=="stable":
+                    phase_progress=float(opt_steps-cfg.wsd.warmup_steps)/max(1,cfg.wsd.stable_steps)
+                else:
+                    phase_progress=float(opt_steps-cfg.wsd.warmup_steps-cfg.wsd.stable_steps)/max(1,cfg.wsd.decay_steps)
+                phase_progress=min(1.0,max(0.0,phase_progress))
+                # T-bucket averages
+                tb_loss={k:(t_bucket_loss[k]["sum"]/max(1,t_bucket_loss[k]["count"])) for k in _T_BUCKET_NAMES}
+                tb_acc={k:(t_bucket_acc[k]["sum"]/max(1,t_bucket_acc[k]["count"])) for k in _T_BUCKET_NAMES}
+                t_mean=t_agg["sum"]/max(1,t_agg["count"])
+                loss_m2t_raw=float(out["loss_m2t"].item())
+                loss_m2t_scaled=float(out.get("loss_m2t_scaled",out["loss_m2t"]).item()) if "loss_m2t_scaled" in out else loss_m2t_raw
                 row={
                     "kind":kind,
                     "epoch":epoch,
@@ -373,27 +485,68 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     "phase":phase.phase,
                     "block_size":phase.block_size,
                     "loss":last_loss,
-                    "loss_m2t":float(out["loss_m2t"].item()),
+                    "loss_masked":loss_m2t_raw,
+                    "loss_scaled":loss_m2t_scaled,
+                    "loss_m2t":loss_m2t_raw,
                     "loss_t2t":float(out["loss_t2t"].item()),
                     "masked_token_acc":out.get("masked_token_acc"),
                     "json_valid_rate":None,
-                    "lr":float(cfg.train.lr),
-                    "tokens_per_sec":tokens_per_second(token_seen,elapsed),
+                    "lr":current_lr,
+                    "wd":float(cfg.train.weight_decay),
+                    "grad_acc":grad_acc,
+                    "micro_batch":int(cfg.train.batch_size),
+                    "seq_len":int(cfg.data.seq_len),
+                    "grad_norm":grad_norm,
+                    "clip_applied":clip_applied,
+                    "tokens_per_sec":tok_per_sec,
+                    "step_time_s":sec_step,
                     "mem":mem_stats(bundle.device),
+                    "vram_alloc_mb":round(vram_alloc_mb,1),
+                    "vram_reserved_mb":round(vram_reserved_mb,1),
+                    "vram_peak_mb":round(vram_peak_mb,1),
+                    "nan_inf_detected":not bool(torch.isfinite(raw_loss).item()) if raw_loss is not None else False,
+                    "nan_inf_count":nan_inf_count,
                     "stage":"wsd" if kind=="cpt" else kind,
                     "step_current":int(opt_steps),
                     "steps_total":int(max_steps),
                     "tokens_seen_total":tok_est,
                     "sec_per_step_avg":float(sec_roll or sec_step),
                     "eta_stage_sec":eta,
-                    "peak_vram_bytes":peak_vram
+                    "peak_vram_bytes":peak_vram,
+                    # Diffusion-specific (continuous-time)
+                    "t_sampled":float(out.get("t_sampled",0)),
+                    "t_mean":t_mean,
+                    "t_min":t_agg["min"],
+                    "t_max":t_agg["max"],
+                    "p_mask_expected":t_mean,
+                    "mask_ratio_actual":float(out.get("mask_ratio_actual",0)),
+                    "loss_by_t_bucket":tb_loss,
+                    "acc_masked_by_t_bucket":tb_acc,
+                    "pred_positions_count":int(out.get("pred_positions_count",0)),
+                    # WSD schedule
+                    "wsd_phase":phase.phase,
+                    "wsd_block_size":phase.block_size,
+                    "wsd_phase_progress":phase_progress,
+                    # Bidirectional status
+                    "bidirectional":bidirectional,
+                    "is_causal_effective":not bidirectional,
+                    "attention_mode":attn_mode,
+                    # Left-shift
+                    "shift_mode":shift_mode,
+                    "time_param":time_param,
+                    "loss_weighting":loss_weighting,
                 }
                 append_jsonl(log_path,[row])
                 if opt_steps==1 or opt_steps%log_every==0 or opt_steps==max_steps:
-                    ts=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime())
                     mta=row['masked_token_acc']
                     mta_s=f"{mta:.4f}" if mta is not None else "n/a"
-                    print(f"{ts} stage={row['stage']} step={row['step_current']}/{row['steps_total']} phase={row['phase']} block={row['block_size']} loss={row['loss']:.6f} mta={mta_s} tok_seen={row['tokens_seen_total']} sec_step={row['sec_per_step_avg']:.3f} eta_sec={row['eta_stage_sec']:.1f} peak_vram={row['peak_vram_bytes']}",flush=True)
+                    _log(f"stage={row['stage']} step={row['step_current']}/{row['steps_total']} phase={row['phase']} block={row['block_size']} bidir={bidirectional} loss={row['loss']:.6f} loss_m={loss_m2t_raw:.4f} loss_s={loss_m2t_scaled:.4f} mta={mta_s} t={row['t_sampled']:.3f} mask%={row['mask_ratio_actual']:.3f} lr={current_lr:.2e} gn={grad_norm:.2f} clip={clip_applied} tok={row['tokens_seen_total']} sec={row['sec_per_step_avg']:.3f} eta={row['eta_stage_sec']:.0f}s vram={row['vram_peak_mb']:.0f}MB")
+                    # Left-shift spot check every 500 steps
+                    if opt_steps==1 or opt_steps%500==0:
+                        _log(f"  SHIFT_CHECK shift_mode={shift_mode} labels_offset=+1 first_position_ignored=True pred_positions_count={out.get('pred_positions_count',0)} masked_pred_positions_count={out.get('pred_positions_count',0)}")
+                    # T-bucket report every log_every
+                    tb_line=" ".join(f"{k}:L={tb_loss[k]:.3f}/A={tb_acc[k]:.3f}" for k in _T_BUCKET_NAMES)
+                    _log(f"  T_BUCKETS t_mean={t_mean:.3f} t_min={t_agg['min']:.3f} t_max={t_agg['max']:.3f} {tb_line}")
                 if tr is not None:
                     tr.record_metric(name=f"{kind}.loss_total",value=last_loss,step=opt_steps,module="training",func="_run")
                     tr.record_metric(name=f"{kind}.loss_m2t",value=float(out["loss_m2t"].item()),step=opt_steps,module="training",func="_run")
@@ -410,13 +563,11 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     ev["step"]=opt_steps
                     append_jsonl(eval_path,[ev])
                 if cooldown_every>0 and cooldown_seconds>0 and opt_steps<max_steps and opt_steps%cooldown_every==0:
-                    ts=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime())
-                    print(f"{ts} stage={row['stage']} cooldown_start step={opt_steps} sleep_sec={cooldown_seconds}",flush=True)
+                    _log(f"stage={row['stage']} cooldown_start step={opt_steps} sleep_sec={cooldown_seconds}")
                     if tr is not None:
                         tr.record_notice(module="training",func="_run",action="cooldown_sleep",reason="thermal_guard",extra_dict={"kind":kind,"step":opt_steps,"sleep_sec":cooldown_seconds})
                     time.sleep(float(cooldown_seconds))
-                    ts=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime())
-                    print(f"{ts} stage={row['stage']} cooldown_end step={opt_steps}",flush=True)
+                    _log(f"stage={row['stage']} cooldown_end step={opt_steps}")
                 if token_seen>=cfg.train.max_tokens:
                     break
         if token_seen>=cfg.train.max_tokens:
@@ -424,6 +575,11 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
         if len(loader)==0:
             break
     elapsed=max(1e-6,time.time()-t0)
+    _log(f"RUN_END kind={kind} steps={opt_steps} loss_last={last_loss:.6f} tokens={token_seen} elapsed={int(elapsed)}s nan_inf_count={nan_inf_count}")
+    try:
+        _run_log_fh.close()
+    except Exception:
+        pass
     summary={
         "kind":kind,
         "steps":opt_steps,

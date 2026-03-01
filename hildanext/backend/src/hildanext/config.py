@@ -82,6 +82,8 @@ class TrainConfig:
     data_pin_memory:bool=True
     cooldown_every_steps:int=0
     cooldown_seconds:int=0
+    grad_clip:float=1.0
+    lr_min_ratio:float=0.1
 
 @dataclass
 class Stage0Config:
@@ -167,15 +169,17 @@ class ExperimentConfig:
     Each field maps to a distinct design choice so runs are reproducible and comparable.
     """
     # P0.1 flags
-    mask_strategy:str="special_mask_token"    # special_mask_token | repurpose_rare_token
-    attention_mode:str="bidirectional_always"  # bidirectional_always | bidirectional_only_stable
-    time_param:str="discrete"                  # discrete | continuous_time
-    loss_weighting:str="none"                  # none | inv_t
-    shift_mode:str="preserve_left_shift"       # preserve_left_shift | bos_and_shift
-    effort:str="medium"                        # instant | low | medium | high | adaptive
+    mask_strategy:str="special_mask_token"         # special_mask_token | repurpose_rare_token
+    attention_mode:str="bidirectional_only_stable"  # bidirectional_always | bidirectional_only_stable | causal_always
+    time_param:str="continuous_time"                # discrete | continuous_time
+    loss_weighting:str="inv_t"                      # none | inv_t
+    shift_mode:str="preserve_left_shift"            # preserve_left_shift | bos_and_shift
+    effort:str="medium"                             # instant | low | medium | high | adaptive
+    t_min:float=0.001                               # continuous-time lower bound
+    t_max:float=1.0                                 # continuous-time upper bound
     # annotation
-    experiment_id:str=""                       # short tag e.g. "exp01_inv_t"
-    notes:str=""                               # free-text, written into run summary JSON
+    experiment_id:str=""                            # short tag e.g. "exp01_inv_t"
+    notes:str=""                                    # free-text, written into run summary JSON
 
 @dataclass
 class AppConfig:

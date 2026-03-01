@@ -490,7 +490,7 @@ def _apply_stage0_to_cfg(cfg:AppConfig,run_id:str|None=None)->AppConfig:
         "runtime":{"run_id":run_id or cfg.runtime.run_id,"use_dinfer":False,"force_dummy_model":False,"device":"cuda"},
         "data":{"seq_len":int(cfg.stage0.seq_len),"doc_mask_mode":str(cfg.stage0.doc_attention_mask_mode),"eval_ratio":float(cfg.data.eval_pct_stage0)},
         "llada2":{"mask_mode":str(cfg.stage0.doc_attention_mask_mode),"composite_block_size":max(1,min(int(cfg.stage0.seq_len),32))},
-        "train":{"dtype":"fp16","batch_size":int(cfg.stage0.micro_batch_size),"accum_steps":int(cfg.stage0.grad_accum_steps),"lr":float(cfg.stage0.lr_stage0),"max_steps":total,"m2t_weight":float(cfg.stage0.m2t_weight),"t2t_weight":float(cfg.stage0.t2t_weight),"mask_ratio":float(cfg.stage0.mask_ratio_m2t),"t2t_noise_ratio":float(cfg.stage0.t2t_edit_ratio),"ckpt_every":int(cfg.stage0.save_every_steps),"eval_every":max(1,int(cfg.stage0.eval_every_steps) if int(cfg.stage0.eval_every_steps)>0 else total+1),"log_every_steps":int(cfg.stage0.log_every_steps),"keep_last_checkpoints":int(cfg.stage0.keep_last_checkpoints),"optimizer":_select_optimizer_name(),"grad_ckpt":True},
+        "train":{"dtype":"fp16","batch_size":int(cfg.stage0.micro_batch_size),"accum_steps":int(cfg.stage0.grad_accum_steps),"lr":float(cfg.stage0.lr_stage0),"max_steps":total,"m2t_weight":float(cfg.stage0.m2t_weight),"t2t_weight":float(cfg.stage0.t2t_weight),"mask_ratio":float(cfg.stage0.mask_ratio_m2t),"t2t_noise_ratio":float(cfg.stage0.t2t_edit_ratio),"ckpt_every":int(cfg.stage0.save_every_steps),"eval_every":max(1,int(cfg.stage0.eval_every_steps) if int(cfg.stage0.eval_every_steps)>0 else total+1),"log_every_steps":int(cfg.stage0.log_every_steps),"keep_last_checkpoints":int(cfg.stage0.keep_last_checkpoints),"optimizer":_select_optimizer_name(),"grad_ckpt":True,"grad_clip":1.0,"lr_min_ratio":0.1},
         "wsd":{"warmup_steps":warm,"stable_steps":stable,"decay_steps":decay,"start_block_size":1,"max_block_size":int(cfg.stage0.seq_len),"end_block_size":int(cfg.stage0.decay_blocks[-1] if cfg.stage0.decay_blocks else 32),"ladder_blocks":[int(x) for x in cfg.stage0.ladder_blocks],"decay_blocks":[int(x) for x in cfg.stage0.decay_blocks],"enforce_divisibility":True}
     })
 
@@ -541,12 +541,32 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
     tok_dir=ensure_dir(cfg.paths.tokenized_dir)
     train_tok=Path(tok_dir)/"train.jsonl"
     eval_tok=Path(tok_dir)/"eval.jsonl"
-    # Checkpoint 2: skip tokenize_split if tokenized output already exists and is non-empty
-    if train_tok.exists() and eval_tok.exists() and train_tok.stat().st_size>_MIN_PROC_BYTES and eval_tok.stat().st_size>_MIN_PROC_BYTES:
+    # Checkpoint 2: skip tokenize_split if tokenized output already exists, is non-empty,
+    # AND has matching seq_len. If seq_len mismatches, delete and re-tokenize.
+    _tok_exists=train_tok.exists() and eval_tok.exists() and train_tok.stat().st_size>_MIN_PROC_BYTES and eval_tok.stat().st_size>_MIN_PROC_BYTES
+    _tok_seq_ok=True
+    if _tok_exists:
+        try:
+            with train_tok.open("r",encoding="utf-8") as _tf:
+                _first=json.loads(_tf.readline())
+                _existing_sl=len(_first.get("input_ids",[]))
+            if _existing_sl!=int(cfg.data.seq_len):
+                _tok_seq_ok=False
+                print(f"[prep] seq_len mismatch: tokenized={_existing_sl} vs config={cfg.data.seq_len}  → re-tokenizing",flush=True)
+                if tr is not None:
+                    tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="tokenize_seq_len_mismatch",reason="retokenize",extra_dict={"existing_seq_len":_existing_sl,"config_seq_len":int(cfg.data.seq_len)})
+                # Remove stale tokenized files
+                for _stale in [train_tok,eval_tok]:
+                    if _stale.exists():
+                        _stale.unlink()
+                        print(f"[prep]   deleted stale {_stale.name}",flush=True)
+        except Exception:
+            _tok_seq_ok=True  # if unreadable, let normal flow decide
+    if _tok_exists and _tok_seq_ok:
         tok_train={"input":split["train_path"],"output":str(train_tok),"records_in":split["num_docs_train"],"records_out":-1,"seq_len":int(cfg.data.seq_len),"skipped":True,"reason":"tokenized_already_exists"}
         tok_eval={"input":split["eval_path"],"output":str(eval_tok),"records_in":split["num_docs_eval"],"records_out":-1,"seq_len":int(cfg.data.seq_len),"skipped":True,"reason":"tokenized_already_exists"}
         if tr is not None:
-            tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="tokenize_skip",reason="tokenized_already_exists",extra_dict={"train_bytes":train_tok.stat().st_size})
+            tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="tokenize_skip",reason="tokenized_already_exists",extra_dict={"train_bytes":train_tok.stat().st_size,"seq_len":int(cfg.data.seq_len)})
     else:
         tok_train=tokenize_split(cfg,split["train_path"],str(train_tok),max_records=None,trace=tr)
         tok_eval=tokenize_split(cfg,split["eval_path"],str(eval_tok),max_records=None,trace=tr)
@@ -731,6 +751,15 @@ def run_wsd(cfg:AppConfig,config_path:str,trace=None,skip_dolma_prep:bool=False)
         eval_tok=Path(run_cfg.paths.tokenized_dir)/"eval.jsonl"
         if not train_tok.exists() or not eval_tok.exists():
             raise RuntimeError(f"skip_dolma_prep_set_but_tokenized_missing paths={train_tok},{eval_tok}")
+        # Verify seq_len matches even when skipping dolma prep
+        try:
+            with train_tok.open("r",encoding="utf-8") as _tf:
+                _first=json.loads(_tf.readline())
+                _existing_sl=len(_first.get("input_ids",[]))
+            if _existing_sl!=int(run_cfg.data.seq_len):
+                raise RuntimeError(f"skip_dolma_prep_seq_len_mismatch: tokenized={_existing_sl} vs config={run_cfg.data.seq_len}. Re-run without --skip-dolma-prep to retokenize.")
+        except (json.JSONDecodeError,KeyError):
+            pass  # unreadable, let training decide
         prep={"skipped":True,"reason":"skip_dolma_prep_flag"}
         verify={"ok":True,"skipped":True,"reason":"skip_dolma_prep_flag"}
         if tr is not None:
@@ -764,11 +793,12 @@ def run_wsd(cfg:AppConfig,config_path:str,trace=None,skip_dolma_prep:bool=False)
 
 def create_stage0_config(cfg:AppConfig,path:Path,dolma_path:str)->AppConfig:
     out_cfg=clone_with_updates(cfg,{
-        "data":{"dolma_path":dolma_path,"tinystories_path":"","max_samples":0,"eval_pct_stage0":0.01,"eval_ratio":0.01},
+        "data":{"dolma_path":dolma_path,"tinystories_path":"","max_samples":0,"eval_pct_stage0":0.01,"eval_ratio":0.01,"seq_len":1024},
         "runtime":{"use_dinfer":False,"strict_fallbacks":True,"device":"cuda","blocking_fallback_actions":["synthetic_dolma","dummy_model_fallback","download_false_empty","dataset_empty"],"blocking_fallback_reasons":["dolma_unavailable","dataset_empty"],"fallback_whitelist":["flash_attention_unavailable","numpy_dll_unavailable"]},
-        "stage0":{"steps_total_stage0":10000,"lr_stage0":3e-5,"micro_batch_size":1,"grad_accum_steps":32,"seq_len":256,"log_every_steps":10,"eval_every_steps":0,"save_every_steps":200,"keep_last_checkpoints":3,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":0.2,"stable_frac":0.6,"decay_frac":0.2,"ladder_blocks":[1,4,32,64,256],"decay_blocks":[256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},
-        "train":{"dtype":"fp16","batch_size":1,"accum_steps":32,"grad_ckpt":True,"optimizer":"adamw","ckpt_every":200,"eval_every":10001,"log_every_steps":10,"keep_last_checkpoints":3,"data_num_workers":4,"data_prefetch_factor":2,"data_persistent_workers":True,"data_pin_memory":True,"cooldown_every_steps":50,"cooldown_seconds":180},
-        "wsd":{"ladder_blocks":[1,4,32,64,256],"decay_blocks":[256,128,64,32],"end_block_size":32,"enforce_divisibility":True},
+        "stage0":{"steps_total_stage0":8000,"lr_stage0":3e-5,"micro_batch_size":1,"grad_accum_steps":16,"seq_len":1024,"log_every_steps":10,"eval_every_steps":500,"save_every_steps":500,"keep_last_checkpoints":3,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":0.10,"stable_frac":0.70,"decay_frac":0.20,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},
+        "train":{"dtype":"fp16","batch_size":1,"accum_steps":16,"grad_ckpt":True,"optimizer":"adamw","lr":3e-5,"warmup_steps":800,"ckpt_every":500,"eval_every":500,"log_every_steps":10,"keep_last_checkpoints":3,"data_num_workers":4,"data_prefetch_factor":2,"data_persistent_workers":True,"data_pin_memory":True,"cooldown_every_steps":100,"cooldown_seconds":120,"grad_clip":1.0,"lr_min_ratio":0.1,"weight_decay":0.01,"max_tokens":999999999},
+        "wsd":{"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"end_block_size":32,"enforce_divisibility":True,"max_block_size":1024},
+        "experiment":{"attention_mode":"bidirectional_only_stable","time_param":"continuous_time","loss_weighting":"inv_t","shift_mode":"preserve_left_shift","t_min":0.001,"t_max":1.0,"experiment_id":"s0_ct_bidir_8k","notes":"Stage0 8k WSD: continuous-time ELBO 1/t, bidirectional stable only, preserve left-shift, seq_len=1024"},
         "inference":{"max_steps":8,"max_new_tokens":16}
     })
     path.parent.mkdir(parents=True,exist_ok=True)
