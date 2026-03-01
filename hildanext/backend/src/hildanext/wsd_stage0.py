@@ -541,6 +541,11 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
     tok_dir=ensure_dir(cfg.paths.tokenized_dir)
     train_tok=Path(tok_dir)/"train.jsonl"
     eval_tok=Path(tok_dir)/"eval.jsonl"
+    # Compute output cap: 2× what WSD needs (to have headroom for future 16k runs)
+    _wsd_seqs_needed=int(cfg.stage0.steps_total_stage0)*int(cfg.stage0.grad_accum_steps)
+    _tok_cap=2*_wsd_seqs_needed  # double
+    _eval_cap=max(1000,int(_tok_cap*float(cfg.data.eval_ratio or cfg.data.eval_pct_stage0 or 0.01)))
+    print(f"[prep] tokenize cap: train={_tok_cap:,} seqs  eval={_eval_cap:,} seqs  (2x WSD need of {_wsd_seqs_needed:,})",flush=True)
     # Checkpoint 2: skip tokenize_split if tokenized output already exists, is non-empty,
     # AND has matching seq_len. If seq_len mismatches, delete and re-tokenize.
     _tok_exists=train_tok.exists() and eval_tok.exists() and train_tok.stat().st_size>_MIN_PROC_BYTES and eval_tok.stat().st_size>_MIN_PROC_BYTES
@@ -560,6 +565,11 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
                     if _stale.exists():
                         _stale.unlink()
                         print(f"[prep]   deleted stale {_stale.name}",flush=True)
+                    # Also remove tokenization checkpoint to prevent resume of old seq_len
+                    _ckpt_file=Path(str(_stale)+".ckpt")
+                    if _ckpt_file.exists():
+                        _ckpt_file.unlink()
+                        print(f"[prep]   deleted stale {_ckpt_file.name}",flush=True)
         except Exception:
             _tok_seq_ok=True  # if unreadable, let normal flow decide
     if _tok_exists and _tok_seq_ok:
@@ -568,8 +578,8 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
         if tr is not None:
             tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="tokenize_skip",reason="tokenized_already_exists",extra_dict={"train_bytes":train_tok.stat().st_size,"seq_len":int(cfg.data.seq_len)})
     else:
-        tok_train=tokenize_split(cfg,split["train_path"],str(train_tok),max_records=None,trace=tr)
-        tok_eval=tokenize_split(cfg,split["eval_path"],str(eval_tok),max_records=None,trace=tr)
+        tok_train=tokenize_split(cfg,split["train_path"],str(train_tok),max_records=None,max_output_seqs=_tok_cap,trace=tr)
+        tok_eval=tokenize_split(cfg,split["eval_path"],str(eval_tok),max_records=None,max_output_seqs=_eval_cap,trace=tr)
     ext_apply={"path":str(ext_doc_dir),"rows_total":0,"rows_replaced":0,"mode":"internal_doc_ids"}
     if ext_doc_info.get("exists") and ext_doc_info.get("compatible"):
         ext_apply=_apply_external_doc_index(train_tok,eval_tok,doc_dir=ext_doc_dir,seq_len=int(cfg.data.seq_len))

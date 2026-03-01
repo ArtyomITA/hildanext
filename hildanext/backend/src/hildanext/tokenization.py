@@ -257,10 +257,11 @@ def _encode_records_batch(
     return result  # type:ignore[return-value]
 
 
-def tokenize_split(cfg:AppConfig,input_path:str,output_path:str,max_records:int|None=None,trace=None)->Dict[str,Any]:
+def tokenize_split(cfg:AppConfig,input_path:str,output_path:str,max_records:int|None=None,max_output_seqs:int|None=None,trace=None)->Dict[str,Any]:
     """Stream-based tokenization with batch encoding and checkpoint/resume support.
     Checkpoint file: output_path + '.ckpt'  (written every CKPT_EVERY chunks = 50k rows).
-    Resume: if .ckpt exists alongside an existing output file, skips consumed rows and appends."""
+    Resume: if .ckpt exists alongside an existing output file, skips consumed rows and appends.
+    max_output_seqs: if set, stop producing output after this many packed sequences."""
     CHUNK_ROWS=5000
     CKPT_EVERY=10        # write checkpoint every N chunks (= 50k rows)
     LOG_EVERY=30         # seconds between progress lines
@@ -341,6 +342,8 @@ def tokenize_split(cfg:AppConfig,input_path:str,output_path:str,max_records:int|
             for row in out_rows:
                 out_f.write(json.dumps(row,separators=(",",":"))+"\n")
                 records_out+=1
+                if max_output_seqs and records_out>=max_output_seqs:
+                    break
             chunk.clear()
             chunks_since_ckpt+=1
             if chunks_since_ckpt>=CKPT_EVERY:
@@ -357,6 +360,8 @@ def tokenize_split(cfg:AppConfig,input_path:str,output_path:str,max_records:int|
                 last_log=now
 
         for line in in_f:
+            if max_output_seqs and records_out>=max_output_seqs:
+                break
             if not line.strip():
                 continue
             try:
@@ -372,7 +377,7 @@ def tokenize_split(cfg:AppConfig,input_path:str,output_path:str,max_records:int|
                 flush_chunk()
         flush_chunk()
         # flush remaining carry-over partial sequence
-        if carry_ids:
+        if carry_ids and (not max_output_seqs or records_out<max_output_seqs):
             need=seq_len-len(carry_ids)
             ids=carry_ids+[pad_id]*need
             docs=carry_docs+[-1]*need
