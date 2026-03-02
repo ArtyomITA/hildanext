@@ -1,0 +1,47 @@
+.terminal {
+  border-radius: 22px;
+  border: 1px solid rgba(63, 224, 255, 0.18);
+  background: var(--bg-terminal);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem 0.95rem;
+  border-bottom: 1px solid rgba(63, 224, 255, 0.14);
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.header strong {
+  color: var(--lime);
+}
+
+.viewport {
+  height: 300px;
+  overflow: auto;
+}
+
+.line {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 0.75rem;
+  padding: 0.35rem 0.95rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: #d5f6ff;
+}
+
+.line span {
+  color: rgba(155, 180, 207, 0.6);
+}
+
+.line code {
+  white-space: pre-wrap;
+}

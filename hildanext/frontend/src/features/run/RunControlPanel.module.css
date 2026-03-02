@@ -1,0 +1,164 @@
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+/* ---- Buttons ---- */
+.btn {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  padding: 0.5rem 0.875rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  line-height: 1.15;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+}
+
+.btn:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
+.btnSub {
+  font-size: 0.64rem;
+  font-weight: 400;
+  opacity: 0.6;
+  letter-spacing: 0.02em;
+}
+
+.btnTest {
+  color: #3fe0ff;
+  border-color: rgba(63, 224, 255, 0.35);
+}
+.btnTest:not(:disabled):hover {
+  background: rgba(63, 224, 255, 0.1);
+  border-color: #3fe0ff;
+}
+
+.btnFull {
+  color: #c9ff44;
+  border-color: rgba(201, 255, 68, 0.35);
+}
+.btnFull:not(:disabled):hover {
+  background: rgba(201, 255, 68, 0.1);
+  border-color: #c9ff44;
+}
+
+.btnStop {
+  color: #ff5555;
+  border-color: rgba(255, 85, 85, 0.35);
+  margin-left: auto;
+}
+.btnStop:not(:disabled):hover {
+  background: rgba(255, 85, 85, 0.1);
+  border-color: #ff5555;
+}
+
+/* ---- Status badge ---- */
+.statusBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  padding: 0.15rem 0.5rem;
+  border-radius: 99px;
+  border: 1px solid transparent;
+}
+
+.idle {
+  border-color: rgba(255, 255, 255, 0.15);
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.running {
+  border-color: #ffb347;
+  color: #ffb347;
+}
+
+.done {
+  border-color: #c9ff44;
+  color: #c9ff44;
+}
+
+.error {
+  border-color: #ff5555;
+  color: #ff5555;
+}
+
+/* Animated pulse dot for 'running' */
+.pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ffb347;
+  animation: blink 1s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.15; }
+}
+
+/* ---- Log box ---- */
+.logBox {
+  background: #0a0e14;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  max-height: 280px;
+  overflow-y: auto;
+  font-family: var(--font-mono, "Menlo", "Consolas", monospace);
+  font-size: 0.72rem;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.72);
+  scroll-behavior: smooth;
+}
+
+.logBox::-webkit-scrollbar {
+  width: 4px;
+}
+.logBox::-webkit-scrollbar-track {
+  background: transparent;
+}
+.logBox::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+.logBoxEmpty {
+  display: flex;
+  align-items: center;
+  min-height: 60px;
+  color: rgba(255, 255, 255, 0.25);
+  font-style: italic;
+}
+
+.emptyHint {
+  font-size: 0.7rem;
+}
+
+.logLine {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.logError {
+  color: #ff6b6b;
+}
+
+.logWarn {
+  color: #ffb347;
+}

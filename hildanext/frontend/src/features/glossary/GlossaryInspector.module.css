@@ -1,0 +1,49 @@
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-bottom: 1rem;
+}
+
+.tab,
+.active {
+  padding: 0.45rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(8, 17, 28, 0.84);
+  color: var(--text-soft);
+}
+
+.active {
+  color: var(--text);
+  border-color: rgba(63, 224, 255, 0.28);
+  background: rgba(63, 224, 255, 0.1);
+}
+
+.body {
+  color: var(--text-soft);
+  display: grid;
+  gap: 0.6rem;
+}
+
+.badge {
+  padding: 0.45rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(8, 18, 29, 0.78);
+  color: var(--text-soft);
+  font-size: 0.78rem;
+}
+
+.body p {
+  margin: 0;
+}
+
+.en {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.it {
+  color: var(--lime);
+}

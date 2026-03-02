@@ -1,0 +1,61 @@
+.timeline {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.track {
+  display: flex;
+  min-height: 88px;
+  border-radius: 22px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+
+.segment {
+  padding: 0.9rem;
+  display: grid;
+  align-content: space-between;
+  gap: 0.5rem;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.segment span {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  max-width: 100%;
+}
+
+.segment strong {
+  font-size: 1.25rem;
+  font-family: var(--font-display);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  max-width: 100%;
+}
+
+.warmup {
+  background: linear-gradient(180deg, rgba(255, 133, 89, 0.18), rgba(255, 133, 89, 0.08));
+}
+
+.stable {
+  background: linear-gradient(180deg, rgba(63, 224, 255, 0.16), rgba(0, 194, 184, 0.08));
+}
+
+.decay {
+  background: linear-gradient(180deg, rgba(201, 255, 68, 0.16), rgba(201, 255, 68, 0.06));
+}
+
+.markers {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}

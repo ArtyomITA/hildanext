@@ -1,0 +1,68 @@
+.bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.1rem;
+  padding: 0.6rem 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: rgba(8, 18, 29, 0.72);
+  backdrop-filter: blur(10px);
+  font-size: 0.8rem;
+}
+
+/* pill */
+.pill {
+  font-weight: 700;
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  padding: 0.28rem 0.7rem;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.bar[data-source="live"] .pill {
+  background: rgba(63, 224, 255, 0.13);
+  color: var(--cyan);
+  border: 1px solid rgba(63, 224, 255, 0.32);
+}
+
+.bar[data-source="mockup"] .pill {
+  background: rgba(255, 182, 72, 0.11);
+  color: var(--amber);
+  border: 1px solid rgba(255, 182, 72, 0.28);
+}
+
+.bar[data-source="missing"] .pill {
+  background: rgba(255, 102, 123, 0.11);
+  color: var(--red);
+  border: 1px solid rgba(255, 102, 123, 0.28);
+}
+
+/* key-value items */
+.item {
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+  white-space: nowrap;
+}
+
+.itemLabel {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.itemValue {
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.hint {
+  margin-left: auto;
+  color: var(--red);
+  font-size: 0.75rem;
+  opacity: 0.8;
+}

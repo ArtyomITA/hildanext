@@ -31,6 +31,11 @@ class GenerateRequest(BaseModel):
     seed:Optional[int]=None
     effort:str=Field(default="medium",description="instant|low|medium|high|adaptive — controls decode steps and tau scaling")
 
+class ArGenerateRequest(BaseModel):
+    prompt:str
+    max_new_tokens:int=Field(default=96,ge=1,le=512)
+    seed:Optional[int]=None
+
 class GenerateResponse(BaseModel):
     text:str
     stats:Dict[str,Any]
@@ -369,6 +374,24 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                 reason="generate_exception",
                 exception_str=exception_with_stack(e),
                 extra_dict={"mode":req.mode}
+            )
+            raise HTTPException(status_code=500,detail=str(e))
+    @app.post("/generate/ar",response_model=GenerateResponse)
+    def generate_ar_endpoint(req:ArGenerateRequest):
+        """Pure autoregressive greedy decode via ar.generate_ar(). Loads model per-request."""
+        from .ar import generate_ar as _generate_ar
+        try:
+            result=_generate_ar(cfg,req.prompt,max_new_tokens=req.max_new_tokens,seed=req.seed,trace=tr)
+            return GenerateResponse(text=result["text"],stats=result,engine=result["engine"])
+        except Exception as e:
+            tr.record_fallback(
+                event="fallback",
+                module="api",
+                func="generate_ar_endpoint",
+                action="api_error",
+                reason="generate_ar_exception",
+                exception_str=exception_with_stack(e),
+                extra_dict={"max_new_tokens":req.max_new_tokens}
             )
             raise HTTPException(status_code=500,detail=str(e))
     @app.post("/jobs/submit",response_model=JobResponse)

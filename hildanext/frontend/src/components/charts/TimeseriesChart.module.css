@@ -1,0 +1,5 @@
+.chart :global(.uplot) {
+  width: 100%;
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+}

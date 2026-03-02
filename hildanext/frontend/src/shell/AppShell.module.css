@@ -1,0 +1,26 @@
+.frame {
+  min-height: 100vh;
+  position: relative;
+  overflow: hidden;
+}
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(circle at 18% 18%, rgba(63, 224, 255, 0.1), transparent 28%),
+    radial-gradient(circle at 88% 10%, rgba(201, 255, 68, 0.08), transparent 18%),
+    radial-gradient(circle at 72% 82%, rgba(255, 133, 89, 0.08), transparent 24%);
+  pointer-events: none;
+}
+
+.body {
+  width: min(calc(100% - 2rem), var(--content-max));
+  margin: 0 auto;
+  padding: 1.25rem 0 2rem;
+  position: relative;
+}
+
+.main {
+  min-width: 0;
+}

@@ -1,0 +1,52 @@
+.rail {
+  display: grid;
+  gap: 1rem;
+}
+
+.block {
+  padding: 1.1rem;
+  border-radius: 22px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.block h2 {
+  margin: 0.2rem 0 1rem;
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+}
+
+.label {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem;
+  margin: 0;
+}
+
+.grid dt {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.grid dd {
+  margin: 0.18rem 0 0;
+  font-weight: 600;
+}
+
+.list {
+  margin: 0.8rem 0 0;
+  padding-left: 1rem;
+  color: var(--text-soft);
+  display: grid;
+  gap: 0.55rem;
+}

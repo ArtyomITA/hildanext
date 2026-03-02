@@ -192,4 +192,7 @@ LLaDA2.0_*.html
 
 
 *
+!hildanext/
+!hildanext/frontend/
+!hildanext/frontend/**
 Hilda NEXT Full Architecture.md
