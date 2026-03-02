@@ -268,11 +268,15 @@ def tokenize_split(cfg:AppConfig,input_path:str,output_path:str,max_records:int|
     TRUNC_PROB=0.01      # pplx-embed trick: 1% of full seqs truncated to random length
 
     tr=use_trace(cfg,trace)
+    _t_tok_load0=time.time()
+    print(f"[tokenize_split] TOKENIZER_LOAD_START model_dir={cfg.paths.model_dir}",flush=True)
     tok=load_tokenizer(cfg.paths.model_dir,cfg.model.trust_remote_code,trace=tr,cfg=cfg)
+    _t_tok_load1=time.time()
     vocab_size=len(tok) if hasattr(tok,"__len__") else 0
     pad_id=int(getattr(tok,"pad_token_id",0) or 0)
     eos_id=int(getattr(tok,"eos_token_id",1) or 1)
     seq_len=cfg.data.seq_len
+    print(f"[tokenize_split] TOKENIZER_LOADED vocab_size={vocab_size} pad_id={pad_id} eos_id={eos_id} seq_len={seq_len} elapsed={_t_tok_load1-_t_tok_load0:.2f}s",flush=True)
     ensure_dir(str(Path(output_path).parent))
     input_size=Path(input_path).stat().st_size if Path(input_path).exists() else 0
 

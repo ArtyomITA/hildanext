@@ -249,24 +249,54 @@ def _periodic_eval(model,tokenizer,device:torch.device,mask_id:int,cfg:AppConfig
 
 def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,trace=None,resume:bool=False,ckpt_every:int|None=None,eval_every:int|None=None)->Dict[str,Any]:
     tr=use_trace(cfg,trace)
+    _t_init_start=time.time()
+    print(f"[_run] INIT_START kind={kind} split={split_name} steps={steps}",flush=True)
+    # ---- dataset load ----
     tok_path=str(Path(cfg.paths.tokenized_dir)/f"{split_name}.jsonl")
+    _t_ds0=time.time()
+    _tok_file_size=Path(tok_path).stat().st_size if Path(tok_path).exists() else 0
+    print(f"[_run] DATASET_LOAD_START path={tok_path} file_size_mb={_tok_file_size//1024//1024}",flush=True)
     ds=TokenizedDataset(tok_path)
+    _t_ds1=time.time()
+    print(f"[_run] DATASET_LOAD_DONE rows={len(ds)} elapsed={_t_ds1-_t_ds0:.1f}s ram_approx_mb={len(ds)*4*int(cfg.data.seq_len)//1024//1024}",flush=True)
     if len(ds)==0:
         raise RuntimeError(f"tokenized split missing or empty: {tok_path}")
     data_workers=max(0,int(getattr(cfg.train,"data_num_workers",0) or 0))
     prefetch=max(1,int(getattr(cfg.train,"data_prefetch_factor",2) or 2))
     persistent=bool(getattr(cfg.train,"data_persistent_workers",True))
     pin_memory=bool(getattr(cfg.train,"data_pin_memory",True) and torch.cuda.is_available())
+    print(f"[_run] DATALOADER_CONFIG workers={data_workers} prefetch={prefetch} persistent={persistent} pin_memory={pin_memory}",flush=True)
     dl_kwargs={"dataset":ds,"batch_size":max(1,cfg.train.batch_size),"shuffle":True,"num_workers":data_workers,"collate_fn":_collate,"pin_memory":pin_memory}
     if data_workers>0:
         dl_kwargs["prefetch_factor"]=prefetch
         dl_kwargs["persistent_workers"]=persistent
+    _t_dl0=time.time()
     loader=DataLoader(**dl_kwargs)
+    _t_dl1=time.time()
+    print(f"[_run] DATALOADER_CREATED batches_approx={len(loader)} elapsed={_t_dl1-_t_dl0:.2f}s",flush=True)
+    # ---- model load ----
+    _vram_before_model=0.0
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        _vram_before_model=float(torch.cuda.memory_allocated())/1024/1024
+    print(f"[_run] MODEL_LOAD_START vram_before_mb={_vram_before_model:.1f}",flush=True)
+    _t_ml0=time.time()
     bundle=load_model_bundle(cfg,for_training=True,trace=tr)
+    _t_ml1=time.time()
+    _vram_after_model=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
+    print(f"[_run] MODEL_LOAD_DONE elapsed={_t_ml1-_t_ml0:.1f}s vram_after_mb={_vram_after_model:.1f} model_vram_mb={_vram_after_model-_vram_before_model:.1f} dummy={bundle.is_dummy} dtype={bundle.actual_dtype}",flush=True)
     ensure_mask_token(bundle.tokenizer,cfg.model.mask_token,model=bundle.model)
     model=bundle.model
     model.train()
+    # ---- optimizer ----
+    print(f"[_run] OPTIMIZER_CREATE_START",flush=True)
+    _t_opt0=time.time()
     opt,opt_name=_make_optimizer(model,cfg,bundle.device,trace=tr)
+    _t_opt1=time.time()
+    _vram_after_opt=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
+    print(f"[_run] OPTIMIZER_CREATED name={opt_name} elapsed={_t_opt1-_t_opt0:.2f}s vram_after_mb={_vram_after_opt:.1f} opt_vram_mb={_vram_after_opt-_vram_after_model:.1f}",flush=True)
+    _t_init_end=time.time()
+    print(f"[_run] INIT_COMPLETE total_init_sec={_t_init_end-_t_init_start:.1f}s",flush=True)
     use_cache=None
     if hasattr(model,"config") and hasattr(model.config,"use_cache"):
         try:
@@ -341,10 +371,16 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     _log(f"  attention_backend=math_sdpa (force_math_sdpa active)")
     if resumed_from:
         _log(f"  resumed_from={resumed_from} opt_steps={opt_steps}")
+    print(f"[_run] TRAINING_LOOP_ENTER max_steps={max_steps} opt_steps={opt_steps} resumed_from={resumed_from}",flush=True)
     while opt_steps<max_steps:
         epoch+=1
         step_base=(epoch-1)*max(1,len(loader))
+        print(f"[_run] EPOCH_START epoch={epoch} loader_len={len(loader)}",flush=True)
+        _t_batch_iter_start=time.time()
         for step,batch in enumerate(loader,start=step_base+1):
+            if step==step_base+1:
+                _t_first_batch=time.time()
+                print(f"[_run] FIRST_BATCH_RECEIVED epoch={epoch} time_to_first_batch={_t_first_batch-_t_batch_iter_start:.2f}s",flush=True)
             if opt_steps>=max_steps:
                 break
             phase=wsd_block(opt_steps,cfg.wsd,seq_len=cfg.data.seq_len) if kind=="cpt" else wsd_block(cfg.wsd.warmup_steps+cfg.wsd.stable_steps,cfg.wsd,seq_len=cfg.data.seq_len)
@@ -364,6 +400,10 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             vocab_cap=max(8,bundle.vocab_size)
             batch["input_ids"]=torch.remainder(batch["input_ids"],vocab_cap)
             token_seen+=int(batch["attention_mask"].sum().item())
+            if step<=step_base+2:
+                _vram_pre_fwd=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
+                print(f"[_run] PRE_FORWARD step={step} vram_mb={_vram_pre_fwd:.1f} batch_shape={batch['input_ids'].shape}",flush=True)
+            _t_fwd0=time.time()
             try:
                 run_mask_mode=cfg.llada2.mask_mode if kind=="cpt" else cfg.data.doc_mask_mode
                 out=compute_m2t_t2t_losses(
@@ -387,6 +427,9 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     t_max=ct_t_max
                 )
             except RuntimeError as e:
+                _t_fwd1=time.time()
+                if step<=step_base+2:
+                    print(f"[_run] FORWARD_EXCEPTION step={step} elapsed={_t_fwd1-_t_fwd0:.3f}s error={str(e)[:100]}",flush=True)
                 if "out of memory" in str(e).lower():
                     oom_happened=True
                     emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_oom_step_{opt_steps:05d}")
@@ -402,6 +445,10 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                         )
                 raise
             raw_loss=out["loss"]
+            _t_fwd1=time.time()
+            if step<=step_base+2:
+                _vram_post_fwd=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
+                print(f"[_run] FORWARD_DONE step={step} elapsed={_t_fwd1-_t_fwd0:.3f}s loss={float(raw_loss.detach().item()):.6f} vram_mb={_vram_post_fwd:.1f}",flush=True)
             if not bool(torch.isfinite(raw_loss).item()):
                 nan_happened=True
                 emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_nan_step_{opt_steps:05d}")
@@ -416,7 +463,14 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     )
                 raise RuntimeError("loss_nan_inf")
             loss=raw_loss/float(grad_acc)
+            if step<=step_base+2:
+                print(f"[_run] BACKWARD_START step={step}",flush=True)
+            _t_bwd0=time.time()
             loss.backward()
+            _t_bwd1=time.time()
+            if step<=step_base+2:
+                _vram_post_bwd=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
+                print(f"[_run] BACKWARD_DONE step={step} elapsed={_t_bwd1-_t_bwd0:.3f}s vram_mb={_vram_post_bwd:.1f}",flush=True)
             if step%grad_acc==0:
                 grad_norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),grad_clip_val))
                 clip_applied=bool(grad_norm>grad_clip_val)

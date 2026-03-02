@@ -689,7 +689,11 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         rep["data"]={"manifest_verdict":manifest_verdict,"split":split_info,"verify":verify,"prep":prep}
         if not verify.get("ok"):
             raise RuntimeError("dolma_verify_failed")
+        print("[preflight_wsd] LOADING_MODEL_FOR_AR_TEST",flush=True)
+        _t_ar_load0=time.time()
         bundle=load_model_bundle(run_cfg,for_training=False,trace=tr)
+        _t_ar_load1=time.time()
+        print(f"[preflight_wsd] MODEL_LOADED_FOR_AR elapsed={_t_ar_load1-_t_ar_load0:.1f}s dummy={bundle.is_dummy} dtype={bundle.actual_dtype}",flush=True)
         rep["model"]={"dummy_model":bundle.is_dummy,"load_reason":bundle.load_reason,"dtype":bundle.actual_dtype,"device":str(bundle.device),"model_name_or_path":bundle.model_name_or_path}
         if bundle.is_dummy:
             if tr is not None:
@@ -702,10 +706,24 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         # Free the AR model from VRAM before loading the training model for the probe.
         # On GTX 1080 (8 GB) having two copies of Qwen3-0.6B + optimizer in memory simultaneously
         # saturates VRAM and causes a Windows hard-freeze.
+        print(f"[preflight_wsd] AR_TEST_OK text='{ar.get('text','')[:60]}' — freeing model",flush=True)
+        _t_free0=time.time()
         del bundle
         torch.cuda.empty_cache()
+        _t_free1=time.time()
+        _vram_after_free=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
+        try:
+            import psutil as _ps
+            _ram_mb=_ps.Process().memory_info().rss/1024/1024
+        except ImportError:
+            _ram_mb=0.0
+        print(f"[preflight_wsd] MODEL_FREED elapsed={_t_free1-_t_free0:.2f}s vram_mb={_vram_after_free:.1f} ram_mb={_ram_mb:.0f}",flush=True)
+        print(f"[preflight_wsd] PROBE_START seq_len=256 steps=1",flush=True)
+        _t_probe0=time.time()
         probe_cfg=clone_with_updates(run_cfg,{"paths":{"logs_dir":str(Path(run_cfg.paths.logs_dir)/f"{tr.run_id}_preflight_probe"),"checkpoints_dir":str(Path(run_cfg.paths.checkpoints_dir)/f"{tr.run_id}_preflight_probe")},"train":{"max_steps":1,"ckpt_every":1,"eval_every":2},"data":{"seq_len":256},"stage0":{"seq_len":256}})
         probe=run_wsd_conversion(probe_cfg,steps=1,trace=tr,resume=False,ckpt_every=1,eval_every=2)
+        _t_probe1=time.time()
+        print(f"[preflight_wsd] PROBE_DONE elapsed={_t_probe1-_t_probe0:.1f}s",flush=True)
         torch.cuda.empty_cache()
         ckpt=Path(probe["checkpoints_dir"])/"step_00001"
         ckpt_ok=ckpt.exists()
