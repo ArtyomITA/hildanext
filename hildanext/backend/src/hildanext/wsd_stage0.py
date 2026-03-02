@@ -336,7 +336,14 @@ def _segment_text(text:str,max_words:int=120)->List[str]:
                 out.append(" ".join(chunk))
     return [x for x in out if x.strip()]
 
-def _split_processed(cfg:AppConfig,source_path:Path,max_docs:int,eval_pct:float,seed:int)->Dict[str,Any]:
+def _split_processed(cfg:AppConfig,source_path:Path,max_docs:int,eval_pct:float,seed:int,max_segments:int|None=None)->Dict[str,Any]:
+    """Split raw Dolma docs into processed train/eval JSONL.
+
+    Args:
+        max_docs: legacy cap on raw docs (0 = unlimited).
+        max_segments: if set, stop after writing this many segments total
+                      (overrides max_docs when both would apply).
+    """
     max_docs_eff=None if int(max_docs)<=0 else int(max_docs)
     proc=ensure_dir(cfg.paths.processed_dir)
     tr_path=proc/"train.jsonl"
@@ -345,6 +352,12 @@ def _split_processed(cfg:AppConfig,source_path:Path,max_docs:int,eval_pct:float,
     n_ev=0
     tok_tr=0
     tok_ev=0
+    t0_sp=time.time()
+    last_sp=t0_sp
+    if max_segments:
+        print(f"[split] START  max_segments={max_segments:,}  eval_pct={eval_pct}",flush=True)
+    else:
+        print(f"[split] START  unlimited  eval_pct={eval_pct}",flush=True)
     with tr_path.open("w",encoding="utf-8") as trf,ev_path.open("w",encoding="utf-8") as evf:
         c=0
         for i,(doc_id,text) in enumerate(stream_docs(source_path,max_docs=max_docs_eff)):
@@ -362,10 +375,19 @@ def _split_processed(cfg:AppConfig,source_path:Path,max_docs:int,eval_pct:float,
                     n_tr+=1
                     tok_tr+=tok_est
                 c+=1
-                if max_docs_eff and c>=max_docs_eff:
+                # Progress every 15 seconds
+                now_sp=time.time()
+                if now_sp-last_sp>=15:
+                    print(f"[split]   segments={c:,}  train={n_tr:,}  eval={n_ev:,}  raw_docs={i:,}  ({int(now_sp-t0_sp)}s)",flush=True)
+                    last_sp=now_sp
+                # Respect caps
+                _cap_hit=(max_docs_eff and c>=max_docs_eff) or (max_segments and c>=max_segments)
+                if _cap_hit:
                     break
-            if max_docs_eff and c>=max_docs_eff:
+            if (max_docs_eff and c>=max_docs_eff) or (max_segments and c>=max_segments):
                 break
+    elapsed_sp=int(time.time()-t0_sp)
+    print(f"[split] DONE   segments={c:,}  train={n_tr:,}  eval={n_ev:,}  ({elapsed_sp}s)",flush=True)
     return {"train_path":str(tr_path),"eval_path":str(ev_path),"num_docs_train":n_tr,"num_docs_eval":n_ev,"num_tokens_train_est":tok_tr,"num_tokens_eval_est":tok_ev}
 
 def _build_tokenized_artifacts(cfg:AppConfig,train_tok_path:Path,eval_tok_path:Path,shard_rows:int=1000)->Dict[str,Any]:
@@ -505,6 +527,10 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
     existing_doc_index=_inspect_existing_doc_index(source) if source.is_dir() else {"exists":False,"compatible":False,"reason":"source_not_dir"}
     ext_doc_dir=_resolve_external_doc_index_dir()
     ext_doc_info=_inspect_existing_doc_index(ext_doc_dir if ext_doc_dir.exists() else Path("__missing__"))
+    # Compute output cap early: needed by both split cap and tokenize cap.
+    _wsd_seqs_needed=int(cfg.stage0.steps_total_stage0)*int(cfg.stage0.grad_accum_steps)
+    _tok_cap=2*_wsd_seqs_needed  # 2× what WSD needs (headroom for future 16k)
+    _eval_cap=max(1000,int(_tok_cap*float(cfg.data.eval_ratio or cfg.data.eval_pct_stage0 or 0.01)))
     # Checkpoint 1: skip _split_processed if output already exists and is non-empty (resume after crash)
     proc_dir=Path(cfg.paths.processed_dir)
     proc_train=proc_dir/"train.jsonl"
@@ -533,7 +559,11 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
         if tr is not None:
             tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="split_processed_skip",reason="processed_already_exists",extra_dict={"train_rows":n_tr,"eval_rows":n_ev,"train_bytes":proc_train.stat().st_size})
     else:
-        split=_split_processed(cfg,source_path=source,max_docs=int(cfg.data.max_samples),eval_pct=float(cfg.data.eval_pct_stage0),seed=99)
+        # Compute how many processed segments we need: _tok_cap seqs × ~10 segs/seq × 3× safety
+        _segs_per_seq=max(1,int(cfg.data.seq_len)//100)  # conservative: ~100 tokens per segment
+        _split_cap=_tok_cap*_segs_per_seq*3
+        print(f"[prep] split cap: {_split_cap:,} segments  (tok_cap={_tok_cap:,} × {_segs_per_seq} segs/seq × 3)",flush=True)
+        split=_split_processed(cfg,source_path=source,max_docs=int(cfg.data.max_samples),eval_pct=float(cfg.data.eval_pct_stage0),seed=99,max_segments=_split_cap)
     if split["num_docs_train"]<=0:
         if tr is not None:
             tr.record_fallback(event="fallback",module="wsd_stage0",func="prepare_dolma_only",action="download_false_empty",reason="dataset_empty",extra_dict={"root_path":man["root_path"],"max_docs":cfg.data.max_samples})
@@ -541,37 +571,37 @@ def prepare_dolma_only(cfg:AppConfig,trace=None)->Dict[str,Any]:
     tok_dir=ensure_dir(cfg.paths.tokenized_dir)
     train_tok=Path(tok_dir)/"train.jsonl"
     eval_tok=Path(tok_dir)/"eval.jsonl"
-    # Compute output cap: 2× what WSD needs (to have headroom for future 16k runs)
-    _wsd_seqs_needed=int(cfg.stage0.steps_total_stage0)*int(cfg.stage0.grad_accum_steps)
-    _tok_cap=2*_wsd_seqs_needed  # double
-    _eval_cap=max(1000,int(_tok_cap*float(cfg.data.eval_ratio or cfg.data.eval_pct_stage0 or 0.01)))
     print(f"[prep] tokenize cap: train={_tok_cap:,} seqs  eval={_eval_cap:,} seqs  (2x WSD need of {_wsd_seqs_needed:,})",flush=True)
     # Checkpoint 2: skip tokenize_split if tokenized output already exists, is non-empty,
     # AND has matching seq_len. If seq_len mismatches, delete and re-tokenize.
-    _tok_exists=train_tok.exists() and eval_tok.exists() and train_tok.stat().st_size>_MIN_PROC_BYTES and eval_tok.stat().st_size>_MIN_PROC_BYTES
+    # NOTE: check seq_len on train_tok EVEN if eval_tok is missing (partial prior run).
+    _target_sl=int(cfg.data.seq_len)
     _tok_seq_ok=True
-    if _tok_exists:
+    # --- seq_len guard: runs whenever train_tok exists (even without eval) ---
+    if train_tok.exists() and train_tok.stat().st_size>_MIN_PROC_BYTES:
         try:
             with train_tok.open("r",encoding="utf-8") as _tf:
                 _first=json.loads(_tf.readline())
                 _existing_sl=len(_first.get("input_ids",[]))
-            if _existing_sl!=int(cfg.data.seq_len):
+            if _existing_sl!=_target_sl:
                 _tok_seq_ok=False
-                print(f"[prep] seq_len mismatch: tokenized={_existing_sl} vs config={cfg.data.seq_len}  → re-tokenizing",flush=True)
+                print(f"[prep] seq_len mismatch: tokenized={_existing_sl} vs config={_target_sl}  → re-tokenizing",flush=True)
                 if tr is not None:
-                    tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="tokenize_seq_len_mismatch",reason="retokenize",extra_dict={"existing_seq_len":_existing_sl,"config_seq_len":int(cfg.data.seq_len)})
-                # Remove stale tokenized files
-                for _stale in [train_tok,eval_tok]:
-                    if _stale.exists():
-                        _stale.unlink()
-                        print(f"[prep]   deleted stale {_stale.name}",flush=True)
-                    # Also remove tokenization checkpoint to prevent resume of old seq_len
-                    _ckpt_file=Path(str(_stale)+".ckpt")
-                    if _ckpt_file.exists():
-                        _ckpt_file.unlink()
-                        print(f"[prep]   deleted stale {_ckpt_file.name}",flush=True)
+                    tr.record_notice(module="wsd_stage0",func="prepare_dolma_only",action="tokenize_seq_len_mismatch",reason="retokenize",extra_dict={"existing_seq_len":_existing_sl,"config_seq_len":_target_sl})
         except Exception:
             _tok_seq_ok=True  # if unreadable, let normal flow decide
+    # --- clean up stale files when seq_len mismatched ---
+    if not _tok_seq_ok:
+        for _stale in [train_tok,eval_tok]:
+            if _stale.exists():
+                _stale.unlink()
+                print(f"[prep]   deleted stale {_stale.name}",flush=True)
+            # Also remove tokenization checkpoint to prevent resume of old seq_len
+            _ckpt_file=Path(str(_stale)+".ckpt")
+            if _ckpt_file.exists():
+                _ckpt_file.unlink()
+                print(f"[prep]   deleted stale {_ckpt_file.name}",flush=True)
+    _tok_exists=train_tok.exists() and eval_tok.exists() and train_tok.stat().st_size>_MIN_PROC_BYTES and eval_tok.stat().st_size>_MIN_PROC_BYTES
     if _tok_exists and _tok_seq_ok:
         tok_train={"input":split["train_path"],"output":str(train_tok),"records_in":split["num_docs_train"],"records_out":-1,"seq_len":int(cfg.data.seq_len),"skipped":True,"reason":"tokenized_already_exists"}
         tok_eval={"input":split["eval_path"],"output":str(eval_tok),"records_in":split["num_docs_eval"],"records_out":-1,"seq_len":int(cfg.data.seq_len),"skipped":True,"reason":"tokenized_already_exists"}
@@ -669,16 +699,24 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         rep["model"]["sample_text_ar"]=ar.get("text","")
         if not str(ar.get("text","")).strip():
             raise RuntimeError("ar_empty_output")
+        # Free the AR model from VRAM before loading the training model for the probe.
+        # On GTX 1080 (8 GB) having two copies of Qwen3-0.6B + optimizer in memory simultaneously
+        # saturates VRAM and causes a Windows hard-freeze.
+        del bundle
+        torch.cuda.empty_cache()
         probe_cfg=clone_with_updates(run_cfg,{"paths":{"logs_dir":str(Path(run_cfg.paths.logs_dir)/f"{tr.run_id}_preflight_probe"),"checkpoints_dir":str(Path(run_cfg.paths.checkpoints_dir)/f"{tr.run_id}_preflight_probe")},"train":{"max_steps":1,"ckpt_every":1,"eval_every":2},"data":{"seq_len":256},"stage0":{"seq_len":256}})
         probe=run_wsd_conversion(probe_cfg,steps=1,trace=tr,resume=False,ckpt_every=1,eval_every=2)
+        torch.cuda.empty_cache()
         ckpt=Path(probe["checkpoints_dir"])/"step_00001"
         ckpt_ok=ckpt.exists()
         load_ok=False
         if ckpt_ok:
             try:
                 from transformers import AutoModelForCausalLM
-                _=AutoModelForCausalLM.from_pretrained(str(ckpt),trust_remote_code=run_cfg.model.trust_remote_code)
+                _m=AutoModelForCausalLM.from_pretrained(str(ckpt),trust_remote_code=run_cfg.model.trust_remote_code)
                 load_ok=True
+                del _m
+                torch.cuda.empty_cache()
             except Exception as e:
                 if tr is not None:
                     tr.record_fallback(event="fallback",module="wsd_stage0",func="preflight_wsd",action="checkpoint_reload_failed",reason="checkpoint_reload_failed",exception_str=exception_with_stack(e),extra_dict={"path":str(ckpt)})
