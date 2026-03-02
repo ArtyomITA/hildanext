@@ -689,26 +689,24 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         rep["data"]={"manifest_verdict":manifest_verdict,"split":split_info,"verify":verify,"prep":prep}
         if not verify.get("ok"):
             raise RuntimeError("dolma_verify_failed")
-        print("[preflight_wsd] LOADING_MODEL_FOR_AR_TEST",flush=True)
-        _t_ar_load0=time.time()
-        bundle=load_model_bundle(run_cfg,for_training=False,trace=tr)
-        _t_ar_load1=time.time()
-        print(f"[preflight_wsd] MODEL_LOADED_FOR_AR elapsed={_t_ar_load1-_t_ar_load0:.1f}s dummy={bundle.is_dummy} dtype={bundle.actual_dtype}",flush=True)
-        rep["model"]={"dummy_model":bundle.is_dummy,"load_reason":bundle.load_reason,"dtype":bundle.actual_dtype,"device":str(bundle.device),"model_name_or_path":bundle.model_name_or_path}
-        if bundle.is_dummy:
-            if tr is not None:
-                tr.record_fallback(event="fallback",module="wsd_stage0",func="preflight_wsd",action="dummy_model_fallback",reason="dummy_model_fallback",extra_dict={"load_reason":bundle.load_reason})
-            raise RuntimeError("dummy_model_fallback")
+        # AR test — generate_ar() loads its own model internally,
+        # so we do NOT pre-load a bundle here (avoids 2× Qwen3 in 8GB VRAM = freeze).
+        print("[preflight_wsd] AR_TEST_START (model loaded inside generate_ar)",flush=True)
+        _t_ar0=time.time()
         ar=generate_ar(run_cfg,prompt="Write one short safe line.",max_new_tokens=16,seed=run_cfg.runtime.seed,trace=tr)
+        _t_ar1=time.time()
+        print(f"[preflight_wsd] AR_TEST_DONE elapsed={_t_ar1-_t_ar0:.1f}s dummy={ar.get('dummy_model')} dtype={ar.get('actual_dtype')}",flush=True)
+        rep["model"]={"dummy_model":ar.get("dummy_model",False),"load_reason":ar.get("load_reason",""),"dtype":ar.get("actual_dtype",""),"device":"cuda","model_name_or_path":run_cfg.model.model_dir}
+        if ar.get("dummy_model"):
+            if tr is not None:
+                tr.record_fallback(event="fallback",module="wsd_stage0",func="preflight_wsd",action="dummy_model_fallback",reason="dummy_model_fallback",extra_dict={"load_reason":ar.get("load_reason","")})
+            raise RuntimeError("dummy_model_fallback")
         rep["model"]["sample_text_ar"]=ar.get("text","")
         if not str(ar.get("text","")).strip():
             raise RuntimeError("ar_empty_output")
-        # Free the AR model from VRAM before loading the training model for the probe.
-        # On GTX 1080 (8 GB) having two copies of Qwen3-0.6B + optimizer in memory simultaneously
-        # saturates VRAM and causes a Windows hard-freeze.
-        print(f"[preflight_wsd] AR_TEST_OK text='{ar.get('text','')[:60]}' — freeing model",flush=True)
+        # Free generate_ar's model — it's out of scope but CUDA cache may hold tensors.
+        print(f"[preflight_wsd] AR_TEST_OK text='{ar.get('text','')[:60]}' — clearing CUDA cache",flush=True)
         _t_free0=time.time()
-        del bundle
         torch.cuda.empty_cache()
         _t_free1=time.time()
         _vram_after_free=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
@@ -717,7 +715,7 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
             _ram_mb=_ps.Process().memory_info().rss/1024/1024
         except ImportError:
             _ram_mb=0.0
-        print(f"[preflight_wsd] MODEL_FREED elapsed={_t_free1-_t_free0:.2f}s vram_mb={_vram_after_free:.1f} ram_mb={_ram_mb:.0f}",flush=True)
+        print(f"[preflight_wsd] CACHE_CLEARED elapsed={_t_free1-_t_free0:.2f}s vram_mb={_vram_after_free:.1f} ram_mb={_ram_mb:.0f}",flush=True)
         print(f"[preflight_wsd] PROBE_START seq_len=256 steps=1",flush=True)
         _t_probe0=time.time()
         probe_cfg=clone_with_updates(run_cfg,{"paths":{"logs_dir":str(Path(run_cfg.paths.logs_dir)/f"{tr.run_id}_preflight_probe"),"checkpoints_dir":str(Path(run_cfg.paths.checkpoints_dir)/f"{tr.run_id}_preflight_probe")},"train":{"max_steps":1,"ckpt_every":1,"eval_every":2},"data":{"seq_len":256},"stage0":{"seq_len":256}})
@@ -862,7 +860,7 @@ def create_stage0_config(cfg:AppConfig,path:Path,dolma_path:str)->AppConfig:
         "data":{"dolma_path":dolma_path,"tinystories_path":"","max_samples":0,"eval_pct_stage0":0.01,"eval_ratio":0.01,"seq_len":1024},
         "runtime":{"use_dinfer":False,"strict_fallbacks":True,"device":"cuda","blocking_fallback_actions":["synthetic_dolma","dummy_model_fallback","download_false_empty","dataset_empty"],"blocking_fallback_reasons":["dolma_unavailable","dataset_empty"],"fallback_whitelist":["flash_attention_unavailable","numpy_dll_unavailable"]},
         "stage0":{"steps_total_stage0":8000,"lr_stage0":3e-5,"micro_batch_size":1,"grad_accum_steps":16,"seq_len":1024,"log_every_steps":10,"eval_every_steps":500,"save_every_steps":500,"keep_last_checkpoints":3,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":0.10,"stable_frac":0.70,"decay_frac":0.20,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},
-        "train":{"dtype":"fp16","batch_size":1,"accum_steps":16,"grad_ckpt":True,"optimizer":"adamw","lr":3e-5,"warmup_steps":800,"ckpt_every":500,"eval_every":500,"log_every_steps":10,"keep_last_checkpoints":3,"data_num_workers":4,"data_prefetch_factor":2,"data_persistent_workers":True,"data_pin_memory":True,"cooldown_every_steps":100,"cooldown_seconds":120,"grad_clip":1.0,"lr_min_ratio":0.1,"weight_decay":0.01,"max_tokens":999999999},
+        "train":{"dtype":"fp16","batch_size":1,"accum_steps":16,"grad_ckpt":True,"optimizer":_select_optimizer_name(),"lr":3e-5,"warmup_steps":800,"ckpt_every":500,"eval_every":500,"log_every_steps":10,"keep_last_checkpoints":3,"data_num_workers":4,"data_prefetch_factor":2,"data_persistent_workers":True,"data_pin_memory":True,"cooldown_every_steps":100,"cooldown_seconds":120,"grad_clip":1.0,"lr_min_ratio":0.1,"weight_decay":0.01,"max_tokens":999999999},
         "wsd":{"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"end_block_size":32,"enforce_divisibility":True,"max_block_size":1024},
         "experiment":{"attention_mode":"bidirectional_only_stable","time_param":"continuous_time","loss_weighting":"inv_t","shift_mode":"preserve_left_shift","t_min":0.001,"t_max":1.0,"experiment_id":"s0_ct_bidir_8k","notes":"Stage0 8k WSD: continuous-time ELBO 1/t, bidirectional stable only, preserve left-shift, seq_len=1024"},
         "inference":{"max_steps":8,"max_new_tokens":16}

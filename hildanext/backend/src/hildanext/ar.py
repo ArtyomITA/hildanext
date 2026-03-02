@@ -37,7 +37,7 @@ def generate_ar(cfg:AppConfig,prompt:str,max_new_tokens:int=64,seed:Optional[int
     if bundle.is_dummy and not text.startswith("[DUMMY] "):
         text=f"[DUMMY] {text}"
     elapsed=max(1e-6,time.time()-t0)
-    return {
+    result={
         "text":text.strip(),
         "engine":"ar-greedy",
         "dummy_model":bundle.is_dummy,
@@ -47,3 +47,7 @@ def generate_ar(cfg:AppConfig,prompt:str,max_new_tokens:int=64,seed:Optional[int
         "tokens_generated":int(new_ids.numel()),
         "tokens_per_sec":tokens_per_second(int(new_ids.numel()),elapsed)
     }
+    # Explicitly free model to reclaim VRAM before caller loads another model.
+    del model,bundle
+    torch.cuda.empty_cache()
+    return result

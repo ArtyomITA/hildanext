@@ -50,18 +50,39 @@ def _collate(batch:List[Dict[str,Any]])->Dict[str,torch.Tensor]:
     resp=torch.tensor([x.get("response_mask",[0]*len(x["input_ids"])) for x in batch],dtype=torch.long)
     return {"input_ids":ids,"doc_ids":docs,"attention_mask":attn,"response_mask":resp}
 
-def _save_checkpoint(model,tokenizer,out_dir:Path,tag:str)->str:
+def _save_checkpoint(model,tokenizer,out_dir:Path,tag:str,optimizer=None)->str:
     ckpt=out_dir/tag
     ckpt.mkdir(parents=True,exist_ok=True)
+    saved_via="unknown"
     if hasattr(model,"save_pretrained"):
         try:
             model.save_pretrained(str(ckpt))
             if hasattr(tokenizer,"save_pretrained"):
                 tokenizer.save_pretrained(str(ckpt))
-            return str(ckpt)
-        except Exception:
-            pass
-    torch.save({"state_dict":model.state_dict()},ckpt/"model.pt")
+            saved_via="save_pretrained"
+        except Exception as e:
+            logging.warning("save_pretrained failed for tag=%s: %s — falling back to torch.save",tag,e)
+            # Clean partial files from failed save_pretrained before fallback
+            for partial in ckpt.glob("*.safetensors"):
+                partial.unlink(missing_ok=True)
+            torch.save({"state_dict":model.state_dict()},ckpt/"model.pt")
+            # Still try to save tokenizer in fallback path
+            if hasattr(tokenizer,"save_pretrained"):
+                try:
+                    tokenizer.save_pretrained(str(ckpt))
+                except Exception:
+                    pass
+            saved_via="torch_save_fallback"
+    else:
+        torch.save({"state_dict":model.state_dict()},ckpt/"model.pt")
+        saved_via="torch_save"
+    # Save optimizer state for proper resume (AdamW8bit momentum/statistics)
+    if optimizer is not None:
+        try:
+            torch.save(optimizer.state_dict(),ckpt/"optimizer.pt")
+        except Exception as e:
+            logging.warning("optimizer state save failed for tag=%s: %s",tag,e)
+    print(f"[checkpoint] saved {tag} via={saved_via} path={ckpt}",flush=True)
     return str(ckpt)
 
 def _prune_checkpoints(ckpt_dir:Path,keep_last:int)->None:
@@ -110,8 +131,10 @@ def _load_checkpoint_model(cfg:AppConfig,model,ckpt_path:Path,device:torch.devic
             obj=torch.load(mp,map_location=device)
             sd=obj.get("state_dict",obj)
             model.load_state_dict(sd,strict=False)
+            print(f"[resume] model loaded from {mp}",flush=True)
             return model
         except Exception as e:
+            logging.warning("checkpoint state_dict load failed at %s: %s — resuming from base model",ckpt_path,e)
             if tr is not None:
                 tr.record_fallback(
                     event="fallback",
@@ -126,8 +149,10 @@ def _load_checkpoint_model(cfg:AppConfig,model,ckpt_path:Path,device:torch.devic
     try:
         from transformers import AutoModelForCausalLM
         m=AutoModelForCausalLM.from_pretrained(str(ckpt_path),trust_remote_code=cfg.model.trust_remote_code)
+        print(f"[resume] model loaded via from_pretrained from {ckpt_path}",flush=True)
         return m.to(device)
     except Exception as e:
+        logging.warning("checkpoint from_pretrained failed at %s: %s — resuming from base model",ckpt_path,e)
         if tr is not None:
             tr.record_fallback(
                 event="fallback",
@@ -139,6 +164,21 @@ def _load_checkpoint_model(cfg:AppConfig,model,ckpt_path:Path,device:torch.devic
                 extra_dict={"ckpt_path":str(ckpt_path)}
             )
         return model
+
+def _load_optimizer_state(optimizer,ckpt_path:Path,device:torch.device)->bool:
+    """Try to restore optimizer state from checkpoint. Returns True if successful."""
+    op=ckpt_path/"optimizer.pt"
+    if not op.exists():
+        print(f"[resume] no optimizer.pt in {ckpt_path} — optimizer starts fresh",flush=True)
+        return False
+    try:
+        opt_state=torch.load(op,map_location=device)
+        optimizer.load_state_dict(opt_state)
+        print(f"[resume] optimizer state restored from {op}",flush=True)
+        return True
+    except Exception as e:
+        logging.warning("optimizer state restore failed at %s: %s — optimizer starts fresh",ckpt_path,e)
+        return False
 
 def _make_optimizer(model,cfg:AppConfig,device:torch.device,trace=None):
     tr=use_trace(cfg,trace)
@@ -354,6 +394,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
         if last_ckpt is not None and last_step>0:
             model=_load_checkpoint_model(cfg,model,last_ckpt,bundle.device,trace=tr)
             opt,opt_name=_make_optimizer(model,cfg,bundle.device,trace=tr)
+            _load_optimizer_state(opt,last_ckpt,bundle.device)
             opt_steps=last_step
             resumed_from=str(last_ckpt)
             if tr is not None:
@@ -372,6 +413,39 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     if resumed_from:
         _log(f"  resumed_from={resumed_from} opt_steps={opt_steps}")
     print(f"[_run] TRAINING_LOOP_ENTER max_steps={max_steps} opt_steps={opt_steps} resumed_from={resumed_from}",flush=True)
+    def _write_summary(reason:str="normal")->Dict[str,Any]:
+        _elapsed=max(1e-6,time.time()-t0)
+        _log(f"RUN_END kind={kind} steps={opt_steps} loss_last={last_loss:.6f} tokens={token_seen} elapsed={int(_elapsed)}s nan_inf_count={nan_inf_count} reason={reason}")
+        try:
+            _run_log_fh.close()
+        except Exception:
+            pass
+        _summary={
+            "kind":kind,
+            "steps":opt_steps,
+            "loss_last":last_loss,
+            "dummy_model":bundle.is_dummy,
+            "reason":bundle.load_reason,
+            "model_name_or_path":bundle.model_name_or_path,
+            "dtype":bundle.actual_dtype,
+            "requested_dtype":bundle.requested_dtype,
+            "grad_ckpt":bool(cfg.train.grad_ckpt),
+            "use_cache":use_cache,
+            "optimizer_name":opt_name,
+            "device":str(bundle.device),
+            "env_issues":bundle.env_issues,
+            "token_seen":token_seen,
+            "tokens_per_sec":tokens_per_second(token_seen,_elapsed),
+            "log_path":str(log_path),
+            "eval_log_path":str(eval_path),
+            "checkpoints_dir":str(ckpt_dir),
+            "resumed_from":resumed_from,
+            "exit_reason":reason,
+            "watchdog":{"oom":oom_happened,"nan":nan_happened},
+            "fallbacks":tr.snapshot_fallbacks(limit=128) if tr is not None else []
+        }
+        write_json(Path(cfg.paths.logs_dir)/f"{kind}.summary.json",_summary)
+        return _summary
     while opt_steps<max_steps:
         epoch+=1
         step_base=(epoch-1)*max(1,len(loader))
@@ -432,7 +506,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     print(f"[_run] FORWARD_EXCEPTION step={step} elapsed={_t_fwd1-_t_fwd0:.3f}s error={str(e)[:100]}",flush=True)
                 if "out of memory" in str(e).lower():
                     oom_happened=True
-                    emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_oom_step_{opt_steps:05d}")
+                    emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_oom_step_{opt_steps:05d}",optimizer=opt)
                     if tr is not None:
                         tr.record_fallback(
                             event="fallback",
@@ -443,6 +517,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                             exception_str=exception_with_stack(e),
                             extra_dict={"kind":kind,"step":opt_steps,"emergency_checkpoint":emergency}
                         )
+                    _write_summary(reason="oom")
                 raise
             raw_loss=out["loss"]
             _t_fwd1=time.time()
@@ -451,7 +526,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 print(f"[_run] FORWARD_DONE step={step} elapsed={_t_fwd1-_t_fwd0:.3f}s loss={float(raw_loss.detach().item()):.6f} vram_mb={_vram_post_fwd:.1f}",flush=True)
             if not bool(torch.isfinite(raw_loss).item()):
                 nan_happened=True
-                emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_nan_step_{opt_steps:05d}")
+                emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_nan_step_{opt_steps:05d}",optimizer=opt)
                 if tr is not None:
                     tr.record_fallback(
                         event="fallback",
@@ -461,6 +536,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                         reason="loss_nan_inf",
                         extra_dict={"kind":kind,"step":opt_steps,"emergency_checkpoint":emergency}
                     )
+                _write_summary(reason="nan_inf")
                 raise RuntimeError("loss_nan_inf")
             loss=raw_loss/float(grad_acc)
             if step<=step_base+2:
@@ -606,7 +682,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     tr.record_metric(name=f"{kind}.loss_m2t",value=float(out["loss_m2t"].item()),step=opt_steps,module="training",func="_run")
                     tr.record_metric(name=f"{kind}.loss_t2t",value=float(out["loss_t2t"].item()),step=opt_steps,module="training",func="_run")
                 if opt_steps==1 or opt_steps==max_steps or opt_steps%ckpt_every==0:
-                    _save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"step_{opt_steps:05d}")
+                    _save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"step_{opt_steps:05d}",optimizer=opt)
                     _prune_checkpoints(Path(ckpt_dir),keep_last)
                 if opt_steps%eval_every==0 or opt_steps==max_steps:
                     ev=_periodic_eval(model,bundle.tokenizer,bundle.device,bundle.mask_id,cfg,seed=cfg.runtime.seed+opt_steps)
@@ -628,36 +704,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             break
         if len(loader)==0:
             break
-    elapsed=max(1e-6,time.time()-t0)
-    _log(f"RUN_END kind={kind} steps={opt_steps} loss_last={last_loss:.6f} tokens={token_seen} elapsed={int(elapsed)}s nan_inf_count={nan_inf_count}")
-    try:
-        _run_log_fh.close()
-    except Exception:
-        pass
-    summary={
-        "kind":kind,
-        "steps":opt_steps,
-        "loss_last":last_loss,
-        "dummy_model":bundle.is_dummy,
-        "reason":bundle.load_reason,
-        "model_name_or_path":bundle.model_name_or_path,
-        "dtype":bundle.actual_dtype,
-        "requested_dtype":bundle.requested_dtype,
-        "grad_ckpt":bool(cfg.train.grad_ckpt),
-        "use_cache":use_cache,
-        "optimizer_name":opt_name,
-        "device":str(bundle.device),
-        "env_issues":bundle.env_issues,
-        "token_seen":token_seen,
-        "tokens_per_sec":tokens_per_second(token_seen,elapsed),
-        "log_path":str(log_path),
-        "eval_log_path":str(eval_path),
-        "checkpoints_dir":str(ckpt_dir),
-        "resumed_from":resumed_from,
-        "watchdog":{"oom":oom_happened,"nan":nan_happened},
-        "fallbacks":tr.snapshot_fallbacks(limit=128) if tr is not None else []
-    }
-    write_json(Path(cfg.paths.logs_dir)/f"{kind}.summary.json",summary)
+    summary=_write_summary(reason="normal")
     return summary
 
 def run_wsd_conversion(cfg:AppConfig,steps:int|None=None,trace=None,resume:bool=False,ckpt_every:int|None=None,eval_every:int|None=None)->Dict[str,Any]:

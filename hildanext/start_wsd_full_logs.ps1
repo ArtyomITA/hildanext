@@ -44,6 +44,10 @@ try{
  }
  $env:HILDANEXT_DOLMA_DOC_INDEX_PATH=$DocIndexPath
  $env:PYTHONUNBUFFERED="1"
+ # --- VRAM Lab optimal settings for GTX 1080 (8GB) ---
+ # Reduce CUDA fragmentation with expandable segments
+ $env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+ # force_math_sdpa() is called automatically at model load (no FlashAttention on Pascal SM_61)
  $docIdxObj=Resolve-Path -Path $DocIndexPath -ErrorAction SilentlyContinue
  if(-not $docIdxObj){ throw "doc_index_path_missing path=$DocIndexPath" }
  $docIdxResolved=[string]$docIdxObj
