@@ -716,6 +716,71 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         except ImportError:
             _ram_mb=0.0
         print(f"[preflight_wsd] CACHE_CLEARED elapsed={_t_free1-_t_free0:.2f}s vram_mb={_vram_after_free:.1f} ram_mb={_ram_mb:.0f}",flush=True)
+        # ---------- Bidirectional attention runtime test ----------
+        # If attention_mode requires bidirectional, verify it actually works.
+        # On failure: auto-disable → fall back to causal_always.
+        _exp_cfg=run_cfg.experiment if hasattr(run_cfg,"experiment") else None
+        _bidir_mode=getattr(_exp_cfg,"attention_mode","bidirectional_only_stable") if _exp_cfg else "bidirectional_only_stable"
+        _bidir_verified=False
+        _bidir_disabled_reason=""
+        if _bidir_mode in ("bidirectional_always","bidirectional_only_stable"):
+            print(f"[preflight_wsd] BIDIR_TEST_START mode={_bidir_mode}",flush=True)
+            try:
+                # The test module lives in tools/tests_wsd/ under the repo root
+                import importlib
+                _repo_root=Path(run_cfg.paths.root)
+                if str(_repo_root) not in sys.path:
+                    sys.path.insert(0,str(_repo_root))
+                _bidir_mod=importlib.import_module("tools.tests_wsd.test_bidirectional_composite_runtime")
+                _bidir_run_all=_bidir_mod.run_all
+                _bidir_report=_bidir_run_all(
+                    model_dir=run_cfg.model.model_dir,
+                    block_size=int(run_cfg.llada2.composite_block_size),
+                    seq_len=128,
+                    out_path=str(Path(run_cfg.paths.root)/"runs"/"reports"/f"{tr.run_id}_bidir_test.json"),
+                )
+                torch.cuda.empty_cache()
+                if _bidir_report.get("all_pass"):
+                    _bidir_verified=True
+                    print(f"[preflight_wsd] BIDIR_TEST_PASS delta_bidir={_bidir_report['bidirectional_test'].get('delta_with_override',0):.8f}",flush=True)
+                else:
+                    _bidir_disabled_reason="bidir_test_failed"
+                    if not _bidir_report.get("bidirectional_pass"):
+                        _bidir_disabled_reason="force_noncausal_not_effective"
+                    elif not _bidir_report.get("doc_gating_pass"):
+                        _bidir_disabled_reason="doc_gating_leakage"
+                    print(f"[preflight_wsd] BIDIR_TEST_FAIL reason={_bidir_disabled_reason} — disabling bidirectional",flush=True,file=sys.stderr)
+            except Exception as _bidir_err:
+                _bidir_disabled_reason=f"bidir_test_exception: {str(_bidir_err)[:120]}"
+                print(f"[preflight_wsd] BIDIR_TEST_EXCEPTION {_bidir_disabled_reason}",flush=True,file=sys.stderr)
+                torch.cuda.empty_cache()
+            # Failsafe: if test failed, override attention_mode → causal_always
+            if not _bidir_verified:
+                print(f"[preflight_wsd] BIDIRECTIONAL_STABLE FAILED, DISABLING — falling back to causal_always",flush=True,file=sys.stderr)
+                if _exp_cfg is not None:
+                    _exp_cfg.attention_mode="causal_always"
+                if tr is not None:
+                    tr.record_fallback(
+                        event="fallback",
+                        module="wsd_stage0",
+                        func="preflight_wsd",
+                        action="bidirectional_disabled",
+                        reason=_bidir_disabled_reason,
+                        extra_dict={"original_mode":_bidir_mode,"effective_mode":"causal_always"}
+                    )
+                # Save effective config so run_wsd picks up the override
+                _eff_cfg_path=Path(run_cfg.paths.root)/"runs"/"reports"/f"{tr.run_id}_config_effective.json"
+                _eff_cfg_path.parent.mkdir(parents=True,exist_ok=True)
+                save_config(run_cfg,_eff_cfg_path)
+                rep["fallbacks"].append({"event":"fallback","action":"bidirectional_disabled","reason":_bidir_disabled_reason})
+        else:
+            _bidir_verified=True  # causal_always doesn't need verification
+        # Persist verification status in config so training picks it up
+        if _exp_cfg is not None:
+            _exp_cfg.bidirectional_verified=_bidir_verified
+            _exp_cfg.bidirectional_disabled_reason=_bidir_disabled_reason
+        rep["bidirectional_verified"]=_bidir_verified
+        rep["bidirectional_disabled_reason"]=_bidir_disabled_reason
         print(f"[preflight_wsd] PROBE_START seq_len=256 steps=1",flush=True)
         _t_probe0=time.time()
         probe_cfg=clone_with_updates(run_cfg,{"paths":{"logs_dir":str(Path(run_cfg.paths.logs_dir)/f"{tr.run_id}_preflight_probe"),"checkpoints_dir":str(Path(run_cfg.paths.checkpoints_dir)/f"{tr.run_id}_preflight_probe")},"train":{"max_steps":1,"ckpt_every":1,"eval_every":2},"data":{"seq_len":256},"stage0":{"seq_len":256}})

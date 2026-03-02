@@ -362,11 +362,19 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     # Experiment flags
     exp=cfg.experiment if hasattr(cfg,"experiment") else None
     attn_mode=getattr(exp,"attention_mode","bidirectional_only_stable") if exp else "bidirectional_only_stable"
+    bidir_verified=getattr(exp,"bidirectional_verified",False) if exp else False
+    bidir_disabled_reason=getattr(exp,"bidirectional_disabled_reason","") if exp else ""
     time_param=getattr(exp,"time_param","continuous_time") if exp else "continuous_time"
     loss_weighting=getattr(exp,"loss_weighting","inv_t") if exp else "inv_t"
     shift_mode=getattr(exp,"shift_mode","preserve_left_shift") if exp else "preserve_left_shift"
     ct_t_min=float(getattr(exp,"t_min",0.001)) if exp else 0.001
     ct_t_max=float(getattr(exp,"t_max",1.0)) if exp else 1.0
+    # Mask / attn-shape derived constants (logged once per phase, zero overhead at step time)
+    _llada2_cfg=getattr(cfg,"llada2",None)
+    _mask_mode=getattr(_llada2_cfg,"mask_mode","none") if _llada2_cfg else "none"
+    _seq=cfg.data.seq_len
+    _bs=cfg.train.batch_size
+    _attn4d_shape=f"[{_bs},1,{2*_seq},{2*_seq}]" if _mask_mode=="composite_llada20" else f"[{_bs},1,{_seq},{_seq}]"
     # File logger (dual: console + file)
     run_log_path.parent.mkdir(parents=True,exist_ok=True)
     _run_log_fh=open(run_log_path,"a",encoding="utf-8")
@@ -405,7 +413,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     # --- One-time start-of-run log ---
     _log(f"RUN_START kind={kind} max_steps={max_steps} grad_acc={grad_acc} seq_len={cfg.data.seq_len} batch_size={cfg.train.batch_size}")
     _log(f"  optimizer={opt_name} lr={lr_base} lr_warmup={lr_warmup} lr_min_ratio={lr_min_ratio} grad_clip={grad_clip_val} wd={cfg.train.weight_decay}")
-    _log(f"  shift_mode={shift_mode} time_param={time_param} loss_weighting={loss_weighting} attention_mode={attn_mode}")
+    _log(f"  shift_mode={shift_mode} time_param={time_param} loss_weighting={loss_weighting} attention_mode={attn_mode} bidir_verified={bidir_verified}")
     _log(f"  t_min={ct_t_min} t_max={ct_t_max} mask_ratio_discrete={cfg.train.mask_ratio}")
     _log(f"  model={bundle.model_name_or_path} dtype={bundle.actual_dtype} device={bundle.device} dummy={bundle.is_dummy}")
     _log(f"  labels_offset=+1 first_position_ignored=True shift_mode={shift_mode}")
@@ -465,10 +473,17 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 bidirectional=(phase.phase=="stable")
             else:
                 bidirectional=False
-            # Log phase transitions
+            # Log phase transitions (once per phase: wsd_phase, bidirectional, verified, mask_mode, attn4d_shape)
             if phase.phase!=last_phase:
-                total_wsd=cfg.wsd.warmup_steps+cfg.wsd.stable_steps+cfg.wsd.decay_steps
-                _log(f"PHASE_CHANGE wsd_phase={phase.phase} block_size={phase.block_size} bidirectional={bidirectional} is_causal_effective={not bidirectional} step={opt_steps}/{max_steps}")
+                _log(
+                    f"PHASE_CHANGE wsd_phase={phase.phase}"
+                    f" bidirectional={bidirectional}"
+                    f" bidirectional_verified={bidir_verified}"
+                    f" mask_mode={_mask_mode}"
+                    f" attn4d_shape={_attn4d_shape}"
+                    f" block_size={phase.block_size}"
+                    f" step={opt_steps}/{max_steps}"
+                )
                 last_phase=phase.phase
             batch={k:v.to(bundle.device,non_blocking=pin_memory) for k,v in batch.items()}
             vocab_cap=max(8,bundle.vocab_size)
@@ -661,6 +676,8 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     "bidirectional":bidirectional,
                     "is_causal_effective":not bidirectional,
                     "attention_mode":attn_mode,
+                    "bidirectional_verified":bidir_verified,
+                    "bidirectional_disabled_reason":bidir_disabled_reason,
                     # Left-shift
                     "shift_mode":shift_mode,
                     "time_param":time_param,

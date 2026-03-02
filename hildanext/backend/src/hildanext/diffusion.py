@@ -2,6 +2,8 @@
 # Main entrypoints: wsd_block,compute_m2t_t2t_losses,apply_remask.
 # Implements WSD + M2T/T2T with doc-mask aware forward fallback.
 from __future__ import annotations
+import contextlib
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict,Tuple,Optional
@@ -11,6 +13,100 @@ from .config import WSDConfig,TrainConfig,RemaskConfig
 from .masks import batch_doc_attention_mask
 from .formulas import llada2_wsd_block
 from .trace import use_trace,exception_with_stack
+
+# ---------------------------------------------------------------------------
+# force_noncausal_attention — context manager
+# ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def force_noncausal_attention(model:torch.nn.Module):
+    """Temporarily disable causal masking inside a HuggingFace transformer model.
+
+    Two independent causal pathways exist in transformers >=4.57:
+      1) ``module.is_causal = True`` on each attention layer → controls the
+         ``is_causal`` flag passed to ``F.scaled_dot_product_attention``.
+      2) ``create_causal_mask`` called in ``Qwen3Model.forward`` → builds a
+         4D lower-triangular mask added on top of the user-supplied mask.
+
+    This context manager neutralises **both**:
+      - Sets ``is_causal = False`` on every attention sub-module.
+      - Monkey-patches ``create_causal_mask`` in ``transformers.models.qwen3``
+        (and ``masking_utils``) to return the user-provided mask unchanged
+        (preserving padding / custom composite masks).
+
+    The original state is always restored in ``finally``.
+    """
+    # --- 1) Flip is_causal on all attention sub-modules ---
+    saved_causal:list[tuple]=[]
+    for name,mod in model.named_modules():
+        if hasattr(mod,"is_causal"):
+            saved_causal.append((mod,mod.is_causal))
+            mod.is_causal=False
+
+    # --- 2) Monkey-patch create_causal_mask ---
+    #   transformers 4.57 Qwen3 calls create_causal_mask in forward().
+    #   The original function already early-exits when a 4D mask is provided
+    #   (returns the user's 4D mask as-is via _preprocess_mask_arguments).
+    #   When NO 4D mask is provided, it builds a causal lower-triangular mask.
+    #   Our patch must: (a) pass through any user-provided 4D mask unchanged,
+    #   (b) when no 4D mask is given, return a fully-permissive (non-causal) mask
+    #   so that attention is bidirectional.
+    _patched_modules:list[tuple]=[]
+    try:
+        import transformers.masking_utils as _mu
+        _orig_mu=_mu.create_causal_mask
+        def _noncausal_mask(*args,**kwargs):
+            # Call original — it already early-exits for 4D masks, returning them as-is.
+            # For 2D/None masks, it would build a causal mask. We call it, then
+            # if the result is a causal mask, replace it with a non-causal one.
+            result=_orig_mu(*args,**kwargs)
+            if result is None:
+                return None
+            # If result is the user's 4D mask (early-exit path), return as-is.
+            # The user's 4D mask already encodes composite block structure.
+            # We detect the early-exit case: the result equals the attention_mask kwarg.
+            user_mask=kwargs.get("attention_mask",None)
+            if user_mask is None and len(args)>=3:
+                user_mask=args[2]  # positional: config, input_embeds, attention_mask
+            if user_mask is not None and result is user_mask:
+                return result  # pass through the user's composite mask
+            # Otherwise result is a freshly-built causal mask — make it non-causal
+            # by filling with zeros (all positions visible).
+            if isinstance(result,torch.Tensor):
+                return torch.zeros_like(result)
+            return result
+        _mu.create_causal_mask=_noncausal_mask
+        _patched_modules.append((_mu,"create_causal_mask",_orig_mu))
+    except (ImportError,AttributeError):
+        pass
+
+    try:
+        import transformers.models.qwen3.modeling_qwen3 as _qm
+        if hasattr(_qm,"create_causal_mask"):
+            _orig_qm=_qm.create_causal_mask
+            _qm.create_causal_mask=_noncausal_mask  # type: ignore[has-type]
+            _patched_modules.append((_qm,"create_causal_mask",_orig_qm))
+    except (ImportError,AttributeError):
+        pass
+
+    # Also patch for Qwen2 (some transformers versions alias Qwen3→Qwen2)
+    try:
+        import transformers.models.qwen2.modeling_qwen2 as _q2
+        if hasattr(_q2,"create_causal_mask"):
+            _orig_q2=_q2.create_causal_mask
+            _q2.create_causal_mask=_noncausal_mask  # type: ignore[has-type]
+            _patched_modules.append((_q2,"create_causal_mask",_orig_q2))
+    except (ImportError,AttributeError):
+        pass
+
+    try:
+        yield model
+    finally:
+        # --- Restore is_causal ---
+        for mod,orig_val in saved_causal:
+            mod.is_causal=orig_val
+        # --- Restore create_causal_mask ---
+        for mod_obj,attr_name,orig_fn in _patched_modules:
+            setattr(mod_obj,attr_name,orig_fn)
 
 @dataclass
 class WSDStep:
@@ -74,11 +170,20 @@ def _forward(model,input_ids:torch.Tensor,attn_1d:torch.Tensor,doc_ids:torch.Ten
             ids2=torch.cat([input_ids,x0],dim=1)
             docs2=torch.cat([doc_ids,doc_ids],dim=1)
             mask2=batch_doc_attention_mask(docs2,causal=False,mask_mode=mask_mode,block_size=composite_block_size,base_len=l)
-            out=model(input_ids=ids2,attention_mask=_attn_for_model(mask2,model))
+            attn4d=_attn_for_model(mask2,model)
+            if bidirectional:
+                with force_noncausal_attention(model):
+                    out=model(input_ids=ids2,attention_mask=attn4d)
+            else:
+                out=model(input_ids=ids2,attention_mask=attn4d)
             logits=out.logits[:,:l,:]
             return SimpleNamespace(logits=logits)
         doc_mask=batch_doc_attention_mask(doc_ids,causal=not bidirectional,mask_mode=mask_mode)
-        return model(input_ids=input_ids,attention_mask=_attn_for_model(doc_mask,model))
+        attn4d=_attn_for_model(doc_mask,model)
+        if bidirectional:
+            with force_noncausal_attention(model):
+                return model(input_ids=input_ids,attention_mask=attn4d)
+        return model(input_ids=input_ids,attention_mask=attn4d)
     except Exception as e:
         if tr is not None:
             tr.record_fallback(

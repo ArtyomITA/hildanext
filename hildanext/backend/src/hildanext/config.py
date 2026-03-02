@@ -180,6 +180,9 @@ class ExperimentConfig:
     # annotation
     experiment_id:str=""                            # short tag e.g. "exp01_inv_t"
     notes:str=""                                    # free-text, written into run summary JSON
+    # Bidirectional verification (set by preflight)
+    bidirectional_verified:bool=False               # True if runtime test confirmed noncausal attention works
+    bidirectional_disabled_reason:str=""             # reason if verification failed and mode was overridden
 
 @dataclass
 class AppConfig:
