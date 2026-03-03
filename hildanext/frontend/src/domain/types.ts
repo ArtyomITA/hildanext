@@ -123,6 +123,11 @@ export interface WsdMeta {
   phase: "warmup" | "stable" | "decay";
   blockSize: number;
   ladderBlocks: number[];
+  /** Schedule step counts from the actual WSD config (llada21_dolma_wsd_only.json). */
+  warmupSteps?: number;
+  stableSteps?: number;
+  decaySteps?: number;
+  totalSteps?: number;
 }
 
 export interface InsightCard {

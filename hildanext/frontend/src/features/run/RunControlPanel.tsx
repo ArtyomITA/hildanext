@@ -9,6 +9,7 @@ const STATUS_LABEL: Record<string, string> = {
   running: "running…",
   done: "done ✓",
   error: "error ✗",
+  stopped: "stopped ■",
 };
 
 export function RunControlPanel() {

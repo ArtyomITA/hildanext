@@ -44,10 +44,15 @@ export function formatDuration(seconds: number) {
 }
 
 export function formatTimestamp(tsUtc: string) {
-  return new Intl.DateTimeFormat("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    timeZone: "UTC",
-  }).format(new Date(tsUtc));
+  if (!tsUtc) return "";
+  try {
+    return new Intl.DateTimeFormat("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZone: "UTC",
+    }).format(new Date(tsUtc));
+  } catch {
+    return "";
+  }
 }

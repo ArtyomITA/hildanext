@@ -13,30 +13,35 @@ function offlineInference(): InferenceScenarioData {
   return { ...s, dataSource: "mockup" };
 }
 
+const POLL_MIN_MS = 5_000;
+const POLL_MAX_MS = 30_000;
+const POLL_BACKOFF = 2;
+
 interface DataState {
   ready: boolean;
   wsd: WsdScenarioData;
   inference: InferenceScenarioData;
+  backendAlive: boolean;
   hydrate: () => Promise<void>;
   setWsdScenario: (id: string) => Promise<void>;
   setInferenceScenario: (id: string) => Promise<void>;
-  /** Start polling the active WSD scenario every `intervalMs` ms. */
   startPolling: (intervalMs: number) => void;
-  /** Stop any active polling timer. */
   stopPolling: () => void;
 }
 
-// Module-level poll timer so it survives re-renders and can be cleared.
 let _pollTimer: number | null = null;
-function stopPolling() {
+let _pollInterval = POLL_MIN_MS;
+
+function stopPollingTimer() {
   if (_pollTimer !== null) {
-    clearInterval(_pollTimer);
+    clearTimeout(_pollTimer);
     _pollTimer = null;
   }
 }
 
 export const useDataStore = create<DataState>((set, get) => ({
   ready: false,
+  backendAlive: false,
   wsd: {
     id: "loading",
     label: "Loading",
@@ -104,7 +109,8 @@ export const useDataStore = create<DataState>((set, get) => ({
     const [wsd, inference] = await Promise.all([
       frontendAdapter
         .loadWsdScenario("live_wsd_run")
-        .catch(() => offlineWsd()),
+        .then((w) => { set({ backendAlive: true }); return w; })
+        .catch(() => { set({ backendAlive: false }); return offlineWsd(); }),
       frontendAdapter
         .loadInferenceScenario("ar_vs_diffusion_compare")
         .catch(() => offlineInference()),
@@ -112,10 +118,14 @@ export const useDataStore = create<DataState>((set, get) => ({
     set({ ready: true, wsd, inference });
   },
   async setWsdScenario(id) {
-    const wsd = await frontendAdapter
-      .loadWsdScenario(id)
-      .catch(() => offlineWsd());
-    set({ wsd });
+    try {
+      const wsd = await frontendAdapter.loadWsdScenario(id);
+      _pollInterval = POLL_MIN_MS;
+      set({ wsd, backendAlive: true });
+    } catch {
+      _pollInterval = Math.min(_pollInterval * POLL_BACKOFF, POLL_MAX_MS);
+      set({ backendAlive: false });
+    }
   },
   async setInferenceScenario(id) {
     const inference = await frontendAdapter
@@ -123,13 +133,15 @@ export const useDataStore = create<DataState>((set, get) => ({
       .catch(() => offlineInference());
     set({ inference });
   },
-  startPolling(intervalMs: number) {
-    stopPolling();
-    _pollTimer = window.setInterval(() => {
+  startPolling(_intervalMs: number) {
+    stopPollingTimer();
+    const tick = () => {
       void get().setWsdScenario("live_wsd_run");
-    }, intervalMs) as number;
+      _pollTimer = window.setTimeout(tick, _pollInterval) as number;
+    };
+    _pollTimer = window.setTimeout(tick, _pollInterval) as number;
   },
   stopPolling() {
-    stopPolling();
+    stopPollingTimer();
   },
 }));

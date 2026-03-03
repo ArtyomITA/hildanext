@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { NormalizedLogEntry } from "../../domain/types";
 import { formatTimestamp } from "../../domain/formatters";
@@ -19,6 +19,13 @@ export function TerminalTranscript({
     overscan: 20,
   });
 
+  // Auto-scroll to bottom when new rows arrive.
+  useEffect(() => {
+    if (rows.length > 0) {
+      rowVirtualizer.scrollToIndex(rows.length - 1, { align: "end" });
+    }
+  }, [rows.length, rowVirtualizer]);
+
   return (
     <div className={styles.terminal}>
       <div className={styles.header}>
@@ -31,7 +38,7 @@ export function TerminalTranscript({
             const row = rows[item.index];
             return (
               <div key={row.id} className={styles.line} style={{ transform: `translateY(${item.start}px)` }}>
-                <span>{formatTimestamp(row.tsUtc)}</span>
+                <span>{row.tsUtc ? formatTimestamp(row.tsUtc) : ""}</span>
                 <code>{row.message}</code>
               </div>
             );

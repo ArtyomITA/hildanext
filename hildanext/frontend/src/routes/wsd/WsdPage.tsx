@@ -91,7 +91,7 @@ export function WsdPage() {
           <RunControlPanel />
 
           <Panel kicker="Schedule" title="Warmup -> stable -> decay">
-            <PhaseTimeline metrics={wsd.metrics} ladderBlocks={wsd.meta.ladderBlocks} />
+            <PhaseTimeline metrics={wsd.metrics} ladderBlocks={wsd.meta.ladderBlocks} meta={wsd.meta} />
           </Panel>
 
           <Panel kicker="Metrics" title="Loss, throughput and VRAM in one viewport">

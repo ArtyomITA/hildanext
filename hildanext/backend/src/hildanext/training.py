@@ -302,8 +302,15 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     if len(ds)==0:
         raise RuntimeError(f"tokenized split missing or empty: {tok_path}")
     data_workers=max(0,int(getattr(cfg.train,"data_num_workers",0) or 0))
+    # Windows: DataLoader multiprocessing (spawn) deadlocks silently when num_workers>0.
+    # Force workers=0 on Windows regardless of config to avoid eternal hang after EPOCH_START.
+    import platform as _platform
+    if _platform.system()=="Windows" and data_workers>0:
+        logging.warning("[_run] Windows detected: forcing data_num_workers=0 (was %d) to prevent DataLoader spawn deadlock",data_workers)
+        print(f"[_run] WINDOWS_WORKERS_OVERRIDE requested={data_workers} forced=0 reason=spawn_deadlock_prevention",flush=True)
+        data_workers=0
     prefetch=max(1,int(getattr(cfg.train,"data_prefetch_factor",2) or 2))
-    persistent=bool(getattr(cfg.train,"data_persistent_workers",True))
+    persistent=bool(getattr(cfg.train,"data_persistent_workers",True)) and data_workers>0
     pin_memory=bool(getattr(cfg.train,"data_pin_memory",True) and torch.cuda.is_available())
     print(f"[_run] DATALOADER_CONFIG workers={data_workers} prefetch={prefetch} persistent={persistent} pin_memory={pin_memory}",flush=True)
     dl_kwargs={"dataset":ds,"batch_size":max(1,cfg.train.batch_size),"shuffle":True,"num_workers":data_workers,"collate_fn":_collate,"pin_memory":pin_memory}

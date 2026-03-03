@@ -22,6 +22,51 @@ from .config import AppConfig,load_config
 from .inference import build_engine
 from .trace import trace_from_cfg,set_active_trace,reset_active_trace,use_trace,exception_with_stack
 
+class _LazyEngine:
+    """Wraps build_engine() with lazy loading.
+
+    The real engine (and its model weights) are loaded only on the first call
+    to .generate() or .bundle.  WSD, run-control, and health endpoints never
+    trigger a model load.
+    """
+    def __init__(self,cfg:AppConfig,trace)->None:
+        self._cfg=cfg
+        self._trace=trace
+        self._engine=None
+        self._lock=threading.Lock()
+        self._loaded=False
+
+    def _ensure(self):
+        """Load the real engine if not yet loaded (thread-safe)."""
+        if self._loaded:
+            return
+        with self._lock:
+            if not self._loaded:
+                self._engine=build_engine(self._cfg,trace=self._trace)
+                self._loaded=True
+
+    # ---- proxied properties / methods --------------------------------
+    @property
+    def name(self)->str:
+        return self._engine.name if self._loaded else "lazy(not loaded)"
+
+    @property
+    def bundle(self):
+        self._ensure()
+        return getattr(self._engine,"bundle",None)
+
+    @property
+    def last_stats(self)->dict:
+        return getattr(self._engine,"last_stats",{}) if self._loaded else {}
+
+    def generate(self,**kwargs)->str:
+        self._ensure()
+        return self._engine.generate(**kwargs)
+
+    def close(self)->None:
+        if self._loaded and self._engine is not None:
+            self._engine.close()
+
 class GenerateRequest(BaseModel):
     prompt:str
     mode:str="S_MODE"
@@ -144,12 +189,52 @@ def _map_run_log_line(line:str,idx:int)->Optional[dict]:
            else "info")
     return {"id":f"rl-{idx}","tsUtc":ts_utc,"source":"console","level":level,"message":msg,"tags":["run_log"]}
 
-def _build_wsd_meta(cfg:Any,latest:Optional[dict])->dict:
+def _build_wsd_meta(cfg:Any,latest:Optional[dict],wsd_cfg_override:Any=None)->dict:
+    """Build WsdMeta dict.
+
+    If `wsd_cfg_override` is provided (e.g. loaded from llada21_dolma_wsd_only.json)
+    its wsd/train sections take priority over cfg for schedule figures.
+    """
     exp=getattr(cfg,"experiment",None)
     run_id=getattr(exp,"experiment_id","unknown") if exp else "unknown"
     notes=(getattr(exp,"notes","") or "")[:40]
-    wsd_cfg=getattr(cfg,"wsd",None)
-    ladder=list(getattr(wsd_cfg,"ladder_blocks",[1])) if wsd_cfg else [1]
+    # Prefer PS1-generated WSD config for schedule fields if available.
+    src=wsd_cfg_override if wsd_cfg_override is not None else cfg
+    wsd_section=getattr(src,"wsd",None)
+    train_section=getattr(src,"train",None)
+    stage0_section=getattr(src,"stage0",None)
+    # ladder_blocks: prefer stage0, then wsd, then train
+    ladder:list
+    if stage0_section and getattr(stage0_section,"ladder_blocks",None):
+        ladder=list(stage0_section.ladder_blocks)
+    elif wsd_section and getattr(wsd_section,"ladder_blocks",None):
+        ladder=list(wsd_section.ladder_blocks)
+    elif train_section and getattr(train_section,"ladder_blocks",None):
+        ladder=list(train_section.ladder_blocks)
+    else:
+        ladder=[1]
+    # warmup/stable/decay steps — prefer stage0 fractional schedule when stage0 is enabled.
+    def _steps(section,field,fallback):
+        v=getattr(section,field,None) if section else None
+        return int(v) if v is not None else fallback
+    stage0_enabled=bool(getattr(stage0_section,"enabled",False)) if stage0_section else False
+    if stage0_enabled and stage0_section:
+        s0_total=int(getattr(stage0_section,"steps_total_stage0",0))
+        if s0_total>0:
+            warmup=int(s0_total*float(getattr(stage0_section,"warmup_frac",0.1)))
+            stable=int(s0_total*float(getattr(stage0_section,"stable_frac",0.7)))
+            decay=s0_total-warmup-stable
+            total=s0_total
+        else:
+            warmup=_steps(wsd_section,"warmup_steps",100)
+            stable=_steps(wsd_section,"stable_steps",300)
+            decay=_steps(wsd_section,"decay_steps",100)
+            total=warmup+stable+decay
+    else:
+        warmup=_steps(wsd_section,"warmup_steps",_steps(getattr(src,"train",None),"warmup_steps",100))
+        stable=_steps(wsd_section,"stable_steps",300)
+        decay=_steps(wsd_section,"decay_steps",100)
+        total=warmup+stable+decay
     try:
         import torch as _torch
         device="cuda" if _torch.cuda.is_available() else "cpu"
@@ -165,10 +250,28 @@ def _build_wsd_meta(cfg:Any,latest:Optional[dict])->dict:
         "phase":latest.get("phase","warmup") if latest else "warmup",
         "blockSize":int(latest.get("block_size",1)) if latest else 1,
         "ladderBlocks":ladder,
+        "warmupSteps":warmup,
+        "stableSteps":stable,
+        "decaySteps":decay,
+        "totalSteps":total,
     }
 
-def _build_wsd_insights(raw_rows:List[dict],latest:Optional[dict])->List[dict]:
+def _build_wsd_insights(raw_rows:List[dict],latest:Optional[dict],run_lines:Optional[List[str]]=None)->List[dict]:
     out:List[dict]=[]
+    # Surface errors from the RunManager subprocess first.
+    if run_lines:
+        joined=" ".join(run_lines[-30:]).upper()
+        if "CUDA_UNAVAILABLE" in joined or "CPU_FALLBACK" in joined:
+            out.append({"id":"cuda-unavail","title":"CUDA unavailable in API process","metric":"device",
+                        "body":"The FE-launched run used the API server's Python (base conda env) which lacks torch+cuda. "
+                               "Use start_wsd_full_logs.ps1 to run via the mdm env, or start the server with mdm python.",
+                        "tone":"critical"})
+        if "STRICT_FALLBACKS VIOLATION" in joined or "RUNTIMEERROR" in joined:
+            # Extract the last RuntimeError line for the card body.
+            last_err=next((l for l in reversed(run_lines) if "RuntimeError" in l or "strict_fallbacks" in l),"")
+            out.append({"id":"strict-fallback","title":"strict_fallbacks violation","metric":"runtime",
+                        "body":last_err[:200] or "Run crashed due to strict_fallbacks. Check run log.",
+                        "tone":"critical"})
     if not raw_rows:
         out.append({"id":"no-run","title":"No training data yet","metric":"step",
                     "body":"WSD training has not started yet. Run start_wsd_full_logs.ps1.",
@@ -202,6 +305,35 @@ def _build_wsd_insights(raw_rows:List[dict],latest:Optional[dict])->List[dict]:
 _REPO_ROOT=Path(__file__).resolve().parents[3]
 _FULL_WSD_CONFIG=str(_REPO_ROOT/"runs"/"configs"/"llada21_dolma_wsd_only.json")
 
+def _find_train_python()->str:
+    """Return the Python executable for training subprocesses.
+
+    Preference order:
+    1. mdm conda env (where torch+cuda is installed):
+       - $CONDA_PREFIX/../envs/mdm/python.exe (when running from base)
+       - $CONDA_PREFIX/python.exe (when already in mdm)
+    2. sys.executable as last resort.
+    """
+    conda_prefix=os.environ.get("CONDA_PREFIX","")
+    candidates:list=[]
+    if conda_prefix:
+        p=Path(conda_prefix)
+        # Already inside mdm?
+        if p.name.lower()=="mdm":
+            candidates.append(p/"python.exe")
+        # Base env → look for envs/mdm
+        candidates.append(p/"envs"/"mdm"/"python.exe")
+        # One level up (e.g. miniconda3/envs/X → miniconda3/envs/mdm)
+        candidates.append(p.parent/"mdm"/"python.exe")
+    # Absolute fallback search in common miniconda/anaconda locations
+    for root in [Path("C:/ProgramData/miniconda3"),Path("C:/ProgramData/anaconda3"),
+                 Path.home()/"miniconda3",Path.home()/"anaconda3"]:
+        candidates.append(root/"envs"/"mdm"/"python.exe")
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return sys.executable
+
 class _RunManager:
     """Manages a single background WSD subprocess."""
     def __init__(self,api_config_path:str="")->None:
@@ -212,6 +344,7 @@ class _RunManager:
         self._logs:deque=deque(maxlen=500)
         self._exit_code:Optional[int]=None
         self._api_config_path=api_config_path
+        self._train_py=_find_train_python()
     def start(self,mode:str)->dict:
         with self._lock:
             if self._status=="running":
@@ -220,13 +353,16 @@ class _RunManager:
             self._exit_code=None
             self._mode=mode
             self._status="running"
+        py=self._train_py
         if mode=="test":
             config=self._api_config_path or _FULL_WSD_CONFIG
-            cmd=[sys.executable,"-m","hildanext.cli","convert-wsd",
+            cmd=[py,"-m","hildanext.cli","convert-wsd",
                  "--config",config,"--steps","10"]
         else:
-            cmd=[sys.executable,"-m","hildanext.cli","run-wsd",
+            cmd=[py,"-m","hildanext.cli","run-wsd",
                  "--config",_FULL_WSD_CONFIG,"--skip-preflight"]
+        with self._lock:
+            self._logs.append(f"[run_manager] python={py}  config={_FULL_WSD_CONFIG}  mode={mode}")
         def _run()->None:
             try:
                 env={**os.environ,"PYTHONUNBUFFERED":"1"}
@@ -269,7 +405,10 @@ class _RunManager:
         except Exception:
             pass
         with self._lock:
-            self._status="idle"
+            # Use "stopped" (not "idle") so FE keeps showing logs after user kills the run.
+            self._logs.append("[run_manager] run stopped by user")
+            self._status="stopped"
+            self._exit_code=-1
             self._proc=None
         return {"ok":True}
     def snapshot(self,tail:int=200)->dict:
@@ -290,9 +429,13 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
     tok=set_active_trace(tr)
     app=FastAPI(title="HildaNext API",version="0.1.0")
     app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
-    engine=build_engine(cfg,trace=tr)
+    # Lazy: model weights are loaded only on first /generate or /generate/ar call.
+    # /run/*, /frontend/wsd, /health work immediately without loading anything.
+    engine=_LazyEngine(cfg,trace=tr)
     jobs:Dict[str,Dict[str,Any]]={}
     run_mgr=_RunManager(api_config_path=config_path)
+    # Make run_mgr accessible from frontend/wsd endpoint to include live subprocess output.
+    app.state.run_mgr=run_mgr
     @app.on_event("shutdown")
     def _shutdown():
         tr.flush()
@@ -300,14 +443,17 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
         engine.close()
     @app.get("/health")
     def health():
-        st=getattr(engine,"last_stats",{}) or {}
-        bundle=getattr(engine,"bundle",None)
+        # engine._loaded is False until first /generate call — no weights in RAM yet.
+        loaded=getattr(engine,"_loaded",True)
+        st=engine.last_stats or {}
+        bundle=engine.bundle if loaded else None
         dummy=bool(getattr(bundle,"is_dummy",False)) if bundle is not None else bool(st.get("dummy_model",False))
         reason=str(getattr(bundle,"load_reason","") if bundle is not None else st.get("load_reason",""))
         issues=getattr(bundle,"env_issues",{}) if bundle is not None else st.get("env_issues",{})
         return {
             "status":"ok",
             "engine":engine.name,
+            "model_loaded":loaded,
             "model_dir":cfg.paths.model_dir,
             "dummy_model":dummy,
             "reason":reason,
@@ -338,8 +484,50 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                         run_logs.append(entry)
             except Exception:
                 pass
-        all_logs=sorted(fallback_logs+run_logs,key=lambda x:x.get("tsUtc") or "")
-        meta=_build_wsd_meta(cfg,latest_raw)
+        # Include live subprocess lines from RunManager (training, tokenization, file reading).
+        live_lines:List[dict]=[]
+        snap=run_mgr.snapshot(tail=500)
+        if snap.get("lines"):  # show lines for ANY status (running/done/error/stopped/idle w/ prior run)
+            for i,line in enumerate(snap.get("lines",[])):
+                upmsg=line.upper()
+                level=("error" if any(k in upmsg for k in ("ERROR","FAIL","OOM","NAN","INF","RUNNER_ERROR"))
+                       else "warning" if any(k in upmsg for k in ("WARN","SKIP","FALLBACK"))
+                       else "notice" if any(k in upmsg for k in ("NOTICE","MANIFEST","TOKENIZ","DOLMA","DOC_INDEX","TRAIN_FILE","REAL_OK","PREFLIGHT","PHASE_CHANGE","CHECKPOINT"))
+                       else "info")
+                # Detect source type from content.
+                source:str="console"
+                if any(k in upmsg for k in ("TOKENIZ","TOKEN_CACHE","SEQ_LEN","DOC_INDEX","DOLMA","MANIFEST","TRAIN_FILE","LOADING","DATASET","REAL_OK")):
+                    source="training"
+                action=None
+                reason=None
+                # Extract action=... reason=... from structured log lines.
+                if "action=" in line:
+                    _m=_re.search(r"action=(\S+)",line)
+                    if _m: action=_m.group(1)
+                if "reason=" in line:
+                    _m=_re.search(r"reason=(\S+)",line)
+                    if _m: reason=_m.group(1)
+                live_lines.append({
+                    "id":f"rm-{i}",
+                    "tsUtc":"",
+                    "source":source,
+                    "level":level,
+                    "module":"run_manager",
+                    "action":action,
+                    "reason":reason,
+                    "message":line,
+                    "tags":["live"],
+                })
+        all_logs=sorted(fallback_logs+run_logs+live_lines,key=lambda x:x.get("tsUtc") or "")
+        # Try to load the PS1-generated WSD config for accurate schedule figures.
+        wsd_override=None
+        try:
+            wsd_cfg_path=Path(_FULL_WSD_CONFIG)
+            if wsd_cfg_path.exists():
+                wsd_override=load_config(str(wsd_cfg_path))
+        except Exception:
+            pass
+        meta=_build_wsd_meta(cfg,latest_raw,wsd_cfg_override=wsd_override)
         return {
             "id":"live_wsd_run",
             "label":f"Live: {meta['runId']}",
@@ -348,7 +536,7 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
             "metrics":metrics,
             "logs":all_logs,
             "processes":[],
-            "insights":_build_wsd_insights(raw_rows,latest_raw),
+            "insights":_build_wsd_insights(raw_rows,latest_raw,run_lines=snap.get("lines")),
         }
     @app.post("/generate",response_model=GenerateResponse)
     def generate(req:GenerateRequest):
