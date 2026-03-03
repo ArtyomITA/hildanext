@@ -29,7 +29,7 @@ const PILL_LABEL: Record<DataSource, string> = {
 export function DataSourceBar({ dataSource, items, hint }: Props) {
   return (
     <div className={styles.bar} data-source={dataSource}>
-      <span className={styles.pill}>{PILL_LABEL[dataSource]}</span>
+      <span className={styles.pill} data-testid="ds-status-pill">{PILL_LABEL[dataSource]}</span>
 
       {items.map((item) => (
         <span key={item.label} className={styles.item}>

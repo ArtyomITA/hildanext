@@ -378,10 +378,19 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
             raise HTTPException(status_code=500,detail=str(e))
     @app.post("/generate/ar",response_model=GenerateResponse)
     def generate_ar_endpoint(req:ArGenerateRequest):
-        """Pure autoregressive greedy decode via ar.generate_ar(). Loads model per-request."""
-        from .ar import generate_ar as _generate_ar
+        """Pure autoregressive greedy decode reusing the server's already-loaded engine bundle."""
+        from .ar import generate_ar_from_bundle as _generate_ar_bundle
         try:
-            result=_generate_ar(cfg,req.prompt,max_new_tokens=req.max_new_tokens,seed=req.seed,trace=tr)
+            # Reuse the engine's pre-loaded bundle — avoids reloading the model from disk.
+            bundle=getattr(engine,"bundle",None)
+            if bundle is None:
+                # Fallback: slow path (loads model fresh) for non-TransformersEngine.
+                from .ar import generate_ar as _generate_ar_slow
+                result=_generate_ar_slow(cfg,req.prompt,max_new_tokens=req.max_new_tokens,seed=req.seed,trace=tr)
+            else:
+                s=cfg.runtime.seed if req.seed is None else int(req.seed)
+                result=_generate_ar_bundle(bundle,req.prompt,max_new_tokens=req.max_new_tokens,seed=s)
+                result["fallbacks"]=tr.snapshot_fallbacks(limit=32)
             return GenerateResponse(text=result["text"],stats=result,engine=result["engine"])
         except Exception as e:
             tr.record_fallback(

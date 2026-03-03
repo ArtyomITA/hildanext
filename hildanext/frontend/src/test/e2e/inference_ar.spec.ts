@@ -439,7 +439,7 @@ test.describe("Inference — shell integration", () => {
     await page.goto("/wsd");
     await page.getByRole("link", { name: /Inference/ }).click();
     await expect(page).toHaveURL(/\/inference/);
-    await expect(page.getByText("OFFLINE MOCKUP")).toBeVisible({ timeout: 8000 });
+    await expect(page.getByTestId("ds-status-pill")).toBeVisible({ timeout: 8000 });
   });
 
   test("primary nav inference link is marked active on /inference", async ({ page }) => {
@@ -492,7 +492,7 @@ test.describe("Inference — screenshots", () => {
   test("after Generate mock run — full page snapshot", async ({ page }) => {
     await gotoInference(page);
     await page.getByRole("button", { name: "Generate mock run" }).click();
-    await expect(page.getByText("LIVE")).toBeVisible({ timeout: 4000 });
+    await expect(page.getByTestId("ds-status-pill").filter({ hasText: "LIVE" })).toBeVisible({ timeout: 4000 });
     await page.waitForTimeout(400);
     await expect(page).toHaveScreenshot("inference-ar-after-generate.png", { fullPage: true });
   });
