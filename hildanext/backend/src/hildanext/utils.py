@@ -21,10 +21,15 @@ def seed_everything(seed:int)->None:
         torch.cuda.manual_seed_all(seed)
 
 def force_math_sdpa()->None:
+    """Configure SDPA backends for Pascal (sm_61).
+    FlashAttention requires sm_80+ so it's disabled.
+    mem_efficient (CUTLASS) works on sm_50+ and is faster than math — enable it.
+    math is kept as fallback for ops where mem_efficient doesn't support the mask shape."""
     if torch.cuda.is_available():
         torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cudnn.benchmark=True
 
 def choose_device(device_hint:str="auto")->torch.device:
     if device_hint=="cpu":

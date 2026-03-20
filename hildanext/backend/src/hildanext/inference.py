@@ -124,7 +124,12 @@ def load_model_bundle(cfg:AppConfig,for_training:bool=False,trace=None)->ModelBu
         model=TinyCausalLM(vocab_size=vocab,hidden_size=256).to(device)
     if for_training and cfg.train.grad_ckpt and hasattr(model,"gradient_checkpointing_enable"):
         try:
-            model.gradient_checkpointing_enable()
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
+        except TypeError:
+            try:
+                model.gradient_checkpointing_enable()
+            except Exception:
+                pass
         except Exception:
             pass
     if for_training and hasattr(model,"config") and hasattr(model.config,"use_cache"):

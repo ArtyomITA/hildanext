@@ -139,14 +139,38 @@ def _pick_positions(base_mask:torch.Tensor,p:float)->torch.Tensor:
             m[idx[0,0],idx[0,1]]=True
     return m
 
-def _causal_loss(logits:torch.Tensor,labels:torch.Tensor)->torch.Tensor:
+def _causal_loss(logits:torch.Tensor,labels:torch.Tensor,num_chunks:int=8)->torch.Tensor:
+    """Cross-entropy with left-shift, computed in chunks to avoid materializing full (B,S,V) logits.
+    Saves ~500MB VRAM for V=151936 (Qwen3). Inspired by torchtune CEWithChunkedOutputLoss."""
     if logits.shape[1]<2:
         return torch.tensor(0.0,device=logits.device)
-    l=logits[:,:-1,:].contiguous()
     y=labels[:,1:].contiguous()
     if not torch.any(y.ne(-100)):
-        return l.sum()*0.0
-    return F.cross_entropy(l.view(-1,l.shape[-1]),y.view(-1),ignore_index=-100)
+        return logits.sum()*0.0
+    S=logits.shape[1]-1
+    V=logits.shape[-1]
+    # For small vocab or short sequences, regular CE is faster
+    if S*V<500_000 or num_chunks<=1:
+        l=logits[:,:-1,:].contiguous()
+        return F.cross_entropy(l.view(-1,V),y.view(-1),ignore_index=-100)
+    # Chunked: split sequence dim into chunks, compute CE per chunk
+    chunk_size=max(1,(S+num_chunks-1)//num_chunks)
+    total_loss=torch.tensor(0.0,device=logits.device,dtype=torch.float32)
+    total_count=0
+    for i in range(0,S,chunk_size):
+        end=min(i+chunk_size,S)
+        # Slice logits on-the-fly — only one chunk in memory at a time
+        l_chunk=logits[:,i:end,:].contiguous()
+        y_chunk=y[:,i:end].contiguous()
+        valid=y_chunk.ne(-100).sum().item()
+        if valid==0:
+            continue
+        ce=F.cross_entropy(l_chunk.view(-1,V),y_chunk.view(-1),ignore_index=-100,reduction="sum")
+        total_loss=total_loss+ce
+        total_count+=valid
+    if total_count==0:
+        return logits.sum()*0.0
+    return total_loss/float(total_count)
 
 def _attn_for_model(mask:torch.Tensor,model)->torch.Tensor:
     m=mask.bool()
@@ -161,7 +185,9 @@ def _attn_for_model(mask:torch.Tensor,model)->torch.Tensor:
     out=out.masked_fill(~m,torch.finfo(dt).min)
     return out
 
+_sdpa_backend_logged=False
 def _forward(model,input_ids:torch.Tensor,attn_1d:torch.Tensor,doc_ids:torch.Tensor,mask_mode:str,clean_ids:Optional[torch.Tensor]=None,composite_block_size:int|None=None,trace=None,cfg=None,bidirectional:bool=False):
+    global _sdpa_backend_logged
     tr=use_trace(cfg,trace)
     try:
         if (mask_mode or "").lower()=="composite_llada20":
@@ -171,6 +197,20 @@ def _forward(model,input_ids:torch.Tensor,attn_1d:torch.Tensor,doc_ids:torch.Ten
             docs2=torch.cat([doc_ids,doc_ids],dim=1)
             mask2=batch_doc_attention_mask(docs2,causal=False,mask_mode=mask_mode,block_size=composite_block_size,base_len=l)
             attn4d=_attn_for_model(mask2,model)
+            if not _sdpa_backend_logged and torch.cuda.is_available():
+                _sdpa_backend_logged=True
+                try:
+                    H=model.config.num_attention_heads
+                    D=model.config.head_dim if hasattr(model.config,"head_dim") else model.config.hidden_size//H
+                    S2=attn4d.shape[-1]
+                    q_probe=torch.randn(1,H,S2,D,device=attn4d.device,dtype=attn4d.dtype)
+                    bid=torch._fused_sdp_choice(q_probe,q_probe,q_probe,attn_mask=attn4d[:1],dropout_p=0.0,is_causal=False)
+                    from torch.nn.attention import SDPBackend
+                    bname=SDPBackend(bid).name
+                    del q_probe
+                    print(f"[SDPA_DIAG] backend={bname} mask_shape={list(attn4d.shape)} dtype={attn4d.dtype} H={H} D={D}",flush=True)
+                except Exception as e:
+                    print(f"[SDPA_DIAG] probe_failed: {e}",flush=True)
             if bidirectional:
                 with force_noncausal_attention(model):
                     out=model(input_ids=ids2,attention_mask=attn4d)

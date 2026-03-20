@@ -498,7 +498,9 @@ def _select_optimizer_name()->str:
     if not torch.cuda.is_available():
         return "adamw"
     try:
-        import bitsandbytes  # noqa: F401
+        import bitsandbytes as bnb
+        if hasattr(bnb.optim,"PagedAdamW8bit"):
+            return "bnb_paged_adamw8bit"
         return "adamw8bit"
     except Exception:
         return "adamw"
@@ -924,8 +926,8 @@ def create_stage0_config(cfg:AppConfig,path:Path,dolma_path:str)->AppConfig:
     out_cfg=clone_with_updates(cfg,{
         "data":{"dolma_path":dolma_path,"tinystories_path":"","max_samples":0,"eval_pct_stage0":0.01,"eval_ratio":0.01,"seq_len":1024},
         "runtime":{"use_dinfer":False,"strict_fallbacks":True,"device":"cuda","blocking_fallback_actions":["synthetic_dolma","dummy_model_fallback","download_false_empty","dataset_empty"],"blocking_fallback_reasons":["dolma_unavailable","dataset_empty"],"fallback_whitelist":["flash_attention_unavailable","numpy_dll_unavailable"]},
-        "stage0":{"steps_total_stage0":8000,"lr_stage0":3e-5,"micro_batch_size":1,"grad_accum_steps":16,"seq_len":1024,"log_every_steps":10,"eval_every_steps":500,"save_every_steps":500,"keep_last_checkpoints":3,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":0.10,"stable_frac":0.70,"decay_frac":0.20,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},
-        "train":{"dtype":"fp16","batch_size":1,"accum_steps":16,"grad_ckpt":True,"optimizer":_select_optimizer_name(),"lr":3e-5,"warmup_steps":800,"ckpt_every":500,"eval_every":500,"log_every_steps":10,"keep_last_checkpoints":3,"data_num_workers":4,"data_prefetch_factor":2,"data_persistent_workers":True,"data_pin_memory":True,"cooldown_every_steps":100,"cooldown_seconds":120,"grad_clip":1.0,"lr_min_ratio":0.1,"weight_decay":0.01,"max_tokens":999999999},
+        "stage0":{"steps_total_stage0":8000,"lr_stage0":3e-5,"micro_batch_size":1,"grad_accum_steps":16,"seq_len":1024,"log_every_steps":10,"eval_every_steps":500,"save_every_steps":50,"keep_last_checkpoints":3,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":0.10,"stable_frac":0.70,"decay_frac":0.20,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},
+        "train":{"dtype":"fp16","batch_size":1,"accum_steps":16,"grad_ckpt":True,"optimizer":_select_optimizer_name(),"lr":3e-5,"warmup_steps":800,"ckpt_every":500,"eval_every":500,"log_every_steps":10,"keep_last_checkpoints":3,"data_num_workers":4,"data_prefetch_factor":2,"data_persistent_workers":True,"data_pin_memory":True,"cooldown_every_steps":100,"cooldown_seconds":120,"grad_clip":1.0,"lr_min_ratio":0.1,"weight_decay":0.01,"max_tokens":999999999,"multi_turn_t2t":1},
         "wsd":{"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"end_block_size":32,"enforce_divisibility":True,"max_block_size":1024},
         "experiment":{"attention_mode":"bidirectional_only_stable","time_param":"continuous_time","loss_weighting":"inv_t","shift_mode":"preserve_left_shift","t_min":0.001,"t_max":1.0,"experiment_id":"s0_ct_bidir_8k","notes":"Stage0 8k WSD: continuous-time ELBO 1/t, bidirectional stable only, preserve left-shift, seq_len=1024"},
         "inference":{"max_steps":8,"max_new_tokens":16}

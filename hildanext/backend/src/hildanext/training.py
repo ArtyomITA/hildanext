@@ -6,8 +6,12 @@ from pathlib import Path
 from typing import Any,Dict,List,Optional,Tuple
 import json
 import logging
+import signal
+import threading
 import time
 import math
+import gc
+import numpy as np
 import torch
 from torch.utils.data import Dataset,DataLoader
 from torch.optim import AdamW
@@ -19,6 +23,69 @@ from .tokenization import ensure_mask_token
 from .formulas import llada21_apply
 from .utils import mem_stats,tokens_per_second,seed_everything
 from .trace import use_trace,exception_with_stack
+
+# --- Signal-based checkpoint save (SIGTERM/SIGINT) ---
+_signal_save_state:Dict[str,Any]={"requested":False,"model":None,"tokenizer":None,"ckpt_dir":None,"step":0,"optimizer":None}
+
+def _signal_handler(signum,frame):
+    """On SIGTERM/SIGINT, save an emergency checkpoint before exiting."""
+    _signal_save_state["requested"]=True
+    s=_signal_save_state
+    if s["model"] is not None and s["ckpt_dir"] is not None:
+        try:
+            tag=f"signal_{signal.Signals(signum).name}_step_{s['step']:05d}"
+            _save_checkpoint(s["model"],s["tokenizer"],Path(s["ckpt_dir"]),tag,optimizer=s["optimizer"])
+            print(f"[signal] emergency checkpoint saved: {tag}",flush=True)
+        except Exception as e:
+            print(f"[signal] emergency checkpoint FAILED: {e}",flush=True)
+
+def _install_signal_handlers():
+    try:
+        signal.signal(signal.SIGTERM,_signal_handler)
+        signal.signal(signal.SIGINT,_signal_handler)
+    except (OSError,ValueError):
+        pass  # not main thread or platform limitation
+
+# --- Watchdog: detects stalled training loops ---
+class _TrainingWatchdog:
+    """Background thread that fires if no heartbeat for timeout_sec seconds."""
+    def __init__(self,timeout_sec:float=600,callback=None):
+        self._timeout=timeout_sec
+        self._callback=callback
+        self._last_beat=time.time()
+        self._stop=threading.Event()
+        self._thread=threading.Thread(target=self._run,daemon=True)
+        self._thread.start()
+    def heartbeat(self):
+        self._last_beat=time.time()
+    def stop(self):
+        self._stop.set()
+    def _run(self):
+        while not self._stop.is_set():
+            self._stop.wait(30)
+            if self._stop.is_set():
+                break
+            elapsed=time.time()-self._last_beat
+            if elapsed>self._timeout:
+                print(f"[watchdog] STALL DETECTED: no heartbeat for {elapsed:.0f}s (timeout={self._timeout:.0f}s)",flush=True)
+                if self._callback:
+                    try:
+                        self._callback()
+                    except Exception:
+                        pass
+                self._last_beat=time.time()  # reset to avoid spamming
+
+# --- GPU thermal query (nvidia-smi) ---
+def _gpu_temp_celsius()->Optional[int]:
+    """Try to read GPU temperature via nvidia-smi. Returns None if unavailable."""
+    try:
+        import subprocess
+        r=subprocess.run(["nvidia-smi","--query-gpu=temperature.gpu","--format=csv,noheader,nounits"],capture_output=True,text=True,timeout=5)
+        if r.returncode==0:
+            return int(r.stdout.strip().split("\n")[0])
+    except Exception:
+        pass
+    return None
 
 def _compute_lr(step:int,warmup_steps:int,total_steps:int,base_lr:float,min_ratio:float=0.1)->float:
     """Linear warmup then cosine decay to base_lr*min_ratio."""
@@ -43,7 +110,94 @@ class TokenizedDataset(Dataset):
     def __getitem__(self,i:int)->Dict[str,Any]:
         return self.rows[i]
 
+class MmapShardedDataset(Dataset):
+    """Memory-mapped dataset reading directly from Dolma numpy shards.
+
+    Uses ~2 MB RAM (metadata only) instead of ~37.5 GB for the JSONL path.
+    Shards are opened lazily with np.load(mmap_mode='r') on first access.
+    """
+    def __init__(self,shard_root:str,max_rows:int|None=None):
+        root=Path(shard_root)
+        meta_path=root/"meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"meta.json not found in {root}")
+        meta=json.loads(meta_path.read_text(encoding="utf-8"))
+        self.seq_len=int(meta["seq_len"])
+        self.total_rows=int(meta["rows_total"])
+        self.n_shards=int(meta["shards"])
+        tok_dir=Path(meta.get("tokens_dir",str(root/"tokens")))
+        doc_dir=Path(meta.get("doc_index_dir",str(root/"doc_index")))
+        # Build shard file lists and cumulative row counts from meta
+        # Standard shards have 1000 rows, last shard has remainder
+        self._tok_files:List[Path]=[]
+        self._doc_files:List[Path]=[]
+        self._cum_rows:List[int]=[0]
+        rows_so_far=0
+        rows_per_shard=1000  # standard Dolma shard size
+        for i in range(self.n_shards):
+            tf=tok_dir/f"tokens_{i:05d}.npy"
+            df=doc_dir/f"doc_index_{i:05d}.npy"
+            if not tf.exists():
+                break
+            self._tok_files.append(tf)
+            self._doc_files.append(df)
+            if i==self.n_shards-1:
+                # Last shard: remainder rows
+                shard_rows=self.total_rows-rows_so_far
+            else:
+                shard_rows=rows_per_shard
+            rows_so_far+=shard_rows
+            self._cum_rows.append(rows_so_far)
+        self.total_rows=min(self.total_rows,rows_so_far)
+        if max_rows is not None and max_rows>0:
+            self.total_rows=min(self.total_rows,max_rows)
+        # Lazy mmap cache (opened on first __getitem__)
+        self._tok_mmaps:Dict[int,np.ndarray]={}
+        self._doc_mmaps:Dict[int,np.ndarray]={}
+
+    def __len__(self)->int:
+        return self.total_rows
+
+    def _shard_for_row(self,idx:int)->Tuple[int,int]:
+        """Binary search for (shard_index, row_within_shard)."""
+        lo,hi=0,len(self._cum_rows)-2
+        while lo<hi:
+            mid=(lo+hi)//2
+            if self._cum_rows[mid+1]<=idx:
+                lo=mid+1
+            else:
+                hi=mid
+        return lo,idx-self._cum_rows[lo]
+
+    def _get_mmap(self,shard_idx:int)->Tuple[np.ndarray,np.ndarray]:
+        if shard_idx not in self._tok_mmaps:
+            self._tok_mmaps[shard_idx]=np.load(self._tok_files[shard_idx],mmap_mode="r")
+            if shard_idx<len(self._doc_files) and self._doc_files[shard_idx].exists():
+                self._doc_mmaps[shard_idx]=np.load(self._doc_files[shard_idx],mmap_mode="r")
+            else:
+                # No doc_index: synthesize all-zeros (single document)
+                self._doc_mmaps[shard_idx]=np.zeros_like(self._tok_mmaps[shard_idx],dtype=np.int32)
+        return self._tok_mmaps[shard_idx],self._doc_mmaps[shard_idx]
+
+    def __getitem__(self,idx:int)->Dict[str,torch.Tensor]:
+        if idx<0 or idx>=self.total_rows:
+            raise IndexError(f"index {idx} out of range [0,{self.total_rows})")
+        shard_idx,row_in_shard=self._shard_for_row(idx)
+        tok_arr,doc_arr=self._get_mmap(shard_idx)
+        # Copy to contiguous numpy then to tensor (torch.from_numpy may fail on Windows DLL issues)
+        input_ids=torch.tensor(tok_arr[row_in_shard].astype(np.int64),dtype=torch.long)
+        doc_ids=torch.tensor(doc_arr[row_in_shard].astype(np.int64),dtype=torch.long)
+        # Attention mask: 1 where doc_id >= 0 (not padding)
+        attention_mask=(doc_ids>=0).long()
+        # Response mask: zeros (no response masking for pre-training)
+        response_mask=torch.zeros(self.seq_len,dtype=torch.long)
+        return {"input_ids":input_ids,"doc_ids":doc_ids,"attention_mask":attention_mask,"response_mask":response_mask}
+
 def _collate(batch:List[Dict[str,Any]])->Dict[str,torch.Tensor]:
+    # Support both dict-of-lists (TokenizedDataset) and dict-of-tensors (MmapShardedDataset)
+    first=batch[0]
+    if isinstance(first.get("input_ids"),torch.Tensor):
+        return {k:torch.stack([x[k] for x in batch]) for k in ("input_ids","doc_ids","attention_mask","response_mask")}
     ids=torch.tensor([x["input_ids"] for x in batch],dtype=torch.long)
     docs=torch.tensor([x["doc_ids"] for x in batch],dtype=torch.long)
     attn=torch.tensor([x["attention_mask"] for x in batch],dtype=torch.long)
@@ -180,15 +334,32 @@ def _load_optimizer_state(optimizer,ckpt_path:Path,device:torch.device)->bool:
         logging.warning("optimizer state restore failed at %s: %s — optimizer starts fresh",ckpt_path,e)
         return False
 
-def _make_optimizer(model,cfg:AppConfig,device:torch.device,trace=None):
+def _make_optimizer(model,cfg:AppConfig,device:torch.device,trace=None,kind:str="cpt"):
     tr=use_trace(cfg,trace)
     name=(cfg.train.optimizer or "auto").lower()
     lr=float(cfg.train.lr)
     wd=float(cfg.train.weight_decay)
-    if name in {"auto","adamw8bit"} and device.type=="cuda":
+    # CPT benefits from faster variance adaptation (beta2=0.95 vs default 0.999)
+    betas=(0.9,0.95) if kind=="cpt" else (0.9,0.999)
+    if name in {"bnb_paged_adamw8bit","paged_adamw8bit"} and device.type=="cuda":
         try:
             import bitsandbytes as bnb
-            return bnb.optim.AdamW8bit(model.parameters(),lr=lr,weight_decay=wd),"AdamW8bit"
+            return bnb.optim.PagedAdamW8bit(model.parameters(),lr=lr,weight_decay=wd,betas=betas),"PagedAdamW8bit"
+        except Exception as e:
+            if tr is not None:
+                tr.record_fallback(
+                    event="fallback",
+                    module="training",
+                    func="_make_optimizer",
+                    action="optimizer_fallback",
+                    reason="paged_adamw8bit_unavailable",
+                    exception_str=exception_with_stack(e),
+                    extra_dict={"requested":name}
+                )
+    if name in {"auto","adamw8bit","bnb_paged_adamw8bit","paged_adamw8bit"} and device.type=="cuda":
+        try:
+            import bitsandbytes as bnb
+            return bnb.optim.AdamW8bit(model.parameters(),lr=lr,weight_decay=wd,betas=betas),"AdamW8bit"
         except Exception as e:
             if tr is not None:
                 tr.record_fallback(
@@ -224,7 +395,7 @@ def _make_optimizer(model,cfg:AppConfig,device:torch.device,trace=None):
             reason="optimizer_unknown",
             extra_dict={"requested":name,"used":"AdamW"}
         )
-    return AdamW(model.parameters(),lr=lr,weight_decay=wd),"AdamW"
+    return AdamW(model.parameters(),lr=lr,weight_decay=wd,betas=betas),"AdamW"
 
 def _decode_safe(tokenizer,ids:torch.Tensor,mask_id:int,dummy:bool=False)->str:
     txt=""
@@ -244,24 +415,23 @@ def _periodic_eval(model,tokenizer,device:torch.device,mask_id:int,cfg:AppConfig
     prompts=list(cfg.recipe.eval_prompts or ["Write one sentence about rain.","Q: 5+7? A:","Complete safely: The quick brown fox"])
     rows=[]
     model.eval()
-    max_new=min(24,int(cfg.inference.max_new_tokens))
-    for i,p in enumerate(prompts[:3]):
-        seed_everything(seed+i)
-        enc=tokenizer([p],return_tensors="pt")
-        inp=enc["input_ids"].to(device)
-        plen=int(inp.shape[1])
-        seq=inp
-        with torch.no_grad():
+    with torch.no_grad():
+        max_new=min(24,int(cfg.inference.max_new_tokens))
+        for i,p in enumerate(prompts[:3]):
+            seed_everything(seed+i)
+            enc=tokenizer([p],return_tensors="pt")
+            inp=enc["input_ids"].to(device)
+            plen=int(inp.shape[1])
+            seq=inp
             for _ in range(max_new):
                 logits=model(input_ids=seq).logits[:,-1,:]
                 nxt=torch.argmax(logits,dim=-1,keepdim=True)
                 seq=torch.cat([seq,nxt],dim=1)
-        ar_text=_decode_safe(tokenizer,seq[0,plen:],mask_id)
-        seed_everything(seed+i)
-        seq2=torch.full((1,plen+max_new),int(mask_id),dtype=torch.long,device=device)
-        seq2[:,:plen]=inp
-        logs=[]
-        with torch.no_grad():
+            ar_text=_decode_safe(tokenizer,seq[0,plen:],mask_id)
+            seed_everything(seed+i)
+            seq2=torch.full((1,plen+max_new),int(mask_id),dtype=torch.long,device=device)
+            seq2[:,:plen]=inp
+            logs=[]
             for st in range(max(1,int(cfg.inference.max_steps))):
                 gen_before=seq2[:,plen:]
                 pred=torch.zeros_like(gen_before)
@@ -283,8 +453,9 @@ def _periodic_eval(model,tokenizer,device:torch.device,mask_id:int,cfg:AppConfig
                 logs.append({"step":st+1,"mask_ratio":float(upd.eq(mask_id).float().mean().item()),"gamma":int(sets.gamma_count),"delta":int(sets.delta_count),"avg_conf_masked":float(conf[gen_before.eq(mask_id)].mean().item()) if gen_before.eq(mask_id).any() else None,"avg_conf_tokens":float(conf[~gen_before.eq(mask_id)].mean().item()) if (~gen_before.eq(mask_id)).any() else None})
                 if float(upd.eq(mask_id).float().mean().item())==0.0:
                     break
-        dllm_text=_decode_safe(tokenizer,seq2[0,plen:],mask_id)
-        rows.append({"prompt":p,"ar":ar_text,"dllm":dllm_text,"decode_logs":logs})
+            dllm_text=_decode_safe(tokenizer,seq2[0,plen:],mask_id)
+            rows.append({"prompt":p,"ar":ar_text,"dllm":dllm_text,"decode_logs":logs})
+    model.train()
     return {"rows":rows}
 
 def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,trace=None,resume:bool=False,ckpt_every:int|None=None,eval_every:int|None=None)->Dict[str,Any]:
@@ -294,11 +465,23 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     # ---- dataset load ----
     tok_path=str(Path(cfg.paths.tokenized_dir)/f"{split_name}.jsonl")
     _t_ds0=time.time()
-    _tok_file_size=Path(tok_path).stat().st_size if Path(tok_path).exists() else 0
-    print(f"[_run] DATASET_LOAD_START path={tok_path} file_size_mb={_tok_file_size//1024//1024}",flush=True)
-    ds=TokenizedDataset(tok_path)
-    _t_ds1=time.time()
-    print(f"[_run] DATASET_LOAD_DONE rows={len(ds)} elapsed={_t_ds1-_t_ds0:.1f}s ram_approx_mb={len(ds)*4*int(cfg.data.seq_len)//1024//1024}",flush=True)
+    # Try memory-mapped Dolma shards first for CPT (avoids loading 5GB JSONL into 37.5GB RAM)
+    _dolma_shard_root=None
+    if kind=="cpt" and hasattr(cfg.data,"dolma_path") and cfg.data.dolma_path:
+        _candidate=Path(cfg.data.dolma_path).parent  # dolma_path points to /raw, shards are at parent
+        if (_candidate/"meta.json").exists():
+            _dolma_shard_root=str(_candidate)
+    if _dolma_shard_root is not None:
+        print(f"[_run] DATASET_MMAP_START shard_root={_dolma_shard_root}",flush=True)
+        ds=MmapShardedDataset(_dolma_shard_root)
+        _t_ds1=time.time()
+        print(f"[_run] DATASET_MMAP_DONE rows={len(ds)} shards={ds.n_shards} elapsed={_t_ds1-_t_ds0:.1f}s ram_approx_mb=2",flush=True)
+    else:
+        _tok_file_size=Path(tok_path).stat().st_size if Path(tok_path).exists() else 0
+        print(f"[_run] DATASET_LOAD_START path={tok_path} file_size_mb={_tok_file_size//1024//1024}",flush=True)
+        ds=TokenizedDataset(tok_path)
+        _t_ds1=time.time()
+        print(f"[_run] DATASET_LOAD_DONE rows={len(ds)} elapsed={_t_ds1-_t_ds0:.1f}s ram_approx_mb={len(ds)*4*int(cfg.data.seq_len)//1024//1024}",flush=True)
     if len(ds)==0:
         raise RuntimeError(f"tokenized split missing or empty: {tok_path}")
     data_workers=max(0,int(getattr(cfg.train,"data_num_workers",0) or 0))
@@ -338,10 +521,17 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     # ---- optimizer ----
     print(f"[_run] OPTIMIZER_CREATE_START",flush=True)
     _t_opt0=time.time()
-    opt,opt_name=_make_optimizer(model,cfg,bundle.device,trace=tr)
+    opt,opt_name=_make_optimizer(model,cfg,bundle.device,trace=tr,kind=kind)
     _t_opt1=time.time()
     _vram_after_opt=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
     print(f"[_run] OPTIMIZER_CREATED name={opt_name} elapsed={_t_opt1-_t_opt0:.2f}s vram_after_mb={_vram_after_opt:.1f} opt_vram_mb={_vram_after_opt-_vram_after_model:.1f}",flush=True)
+    # ---- AMP autocast config (model already loads in fp16, so GradScaler is not used) ----
+    _use_amp=bundle.device.type=="cuda"
+    print(f"[_run] AMP_CONFIG autocast={_use_amp} dtype=float16",flush=True)
+    # ---- VRAM cleanup after init ----
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
     _t_init_end=time.time()
     print(f"[_run] INIT_COMPLETE total_init_sec={_t_init_end-_t_init_start:.1f}s",flush=True)
     use_cache=None
@@ -408,7 +598,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
         last_step,last_ckpt=_latest_checkpoint(Path(ckpt_dir))
         if last_ckpt is not None and last_step>0:
             model=_load_checkpoint_model(cfg,model,last_ckpt,bundle.device,trace=tr)
-            opt,opt_name=_make_optimizer(model,cfg,bundle.device,trace=tr)
+            opt,opt_name=_make_optimizer(model,cfg,bundle.device,trace=tr,kind=kind)
             _load_optimizer_state(opt,last_ckpt,bundle.device)
             opt_steps=last_step
             resumed_from=str(last_ckpt)
@@ -424,10 +614,21 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     _log(f"  t_min={ct_t_min} t_max={ct_t_max} mask_ratio_discrete={cfg.train.mask_ratio}")
     _log(f"  model={bundle.model_name_or_path} dtype={bundle.actual_dtype} device={bundle.device} dummy={bundle.is_dummy}")
     _log(f"  labels_offset=+1 first_position_ignored=True shift_mode={shift_mode}")
-    _log(f"  attention_backend=math_sdpa (force_math_sdpa active)")
+    _log(f"  attention_backend=mem_efficient+math_sdpa (flash_sdp disabled, cudnn.benchmark=True)")
     if resumed_from:
         _log(f"  resumed_from={resumed_from} opt_steps={opt_steps}")
     print(f"[_run] TRAINING_LOOP_ENTER max_steps={max_steps} opt_steps={opt_steps} resumed_from={resumed_from}",flush=True)
+    # --- Install signal handlers for crash resilience ---
+    _install_signal_handlers()
+    _signal_save_state.update({"model":model,"tokenizer":bundle.tokenizer,"ckpt_dir":str(ckpt_dir),"step":opt_steps,"optimizer":opt})
+    # --- Watchdog thread (10 min timeout) ---
+    _watchdog_cb=lambda: _save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"watchdog_stall_step_{opt_steps:05d}",optimizer=opt)
+    watchdog=_TrainingWatchdog(timeout_sec=600,callback=_watchdog_cb)
+    # --- NaN/Inf progressive recovery config ---
+    _nan_skip_limit=5  # max consecutive NaN batches before hard crash
+    _nan_skip_streak=0
+    # --- Thermal protection config ---
+    _thermal_limit=85  # celsius — throttle if above
     def _write_summary(reason:str="normal")->Dict[str,Any]:
         _elapsed=max(1e-6,time.time()-t0)
         _log(f"RUN_END kind={kind} steps={opt_steps} loss_last={last_loss:.6f} tokens={token_seen} elapsed={int(_elapsed)}s nan_inf_count={nan_inf_count} reason={reason}")
@@ -502,26 +703,27 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             _t_fwd0=time.time()
             try:
                 run_mask_mode=cfg.llada2.mask_mode if kind=="cpt" else cfg.data.doc_mask_mode
-                out=compute_m2t_t2t_losses(
-                    model=model,
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    doc_ids=batch["doc_ids"],
-                    response_mask=batch["response_mask"],
-                    mask_id=bundle.mask_id,
-                    vocab_size=vocab_cap,
-                    cfg=cfg.train,
-                    focus_response=focus_response,
-                    mask_mode=run_mask_mode,
-                    composite_block_size=cfg.llada2.composite_block_size,
-                    trace=tr,
-                    cfg_obj=cfg,
-                    bidirectional=bidirectional,
-                    time_param=time_param,
-                    loss_weighting=loss_weighting,
-                    t_min=ct_t_min,
-                    t_max=ct_t_max
-                )
+                with torch.amp.autocast("cuda",dtype=torch.float16,enabled=_use_amp):
+                    out=compute_m2t_t2t_losses(
+                        model=model,
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        doc_ids=batch["doc_ids"],
+                        response_mask=batch["response_mask"],
+                        mask_id=bundle.mask_id,
+                        vocab_size=vocab_cap,
+                        cfg=cfg.train,
+                        focus_response=focus_response,
+                        mask_mode=run_mask_mode,
+                        composite_block_size=cfg.llada2.composite_block_size,
+                        trace=tr,
+                        cfg_obj=cfg,
+                        bidirectional=bidirectional,
+                        time_param=time_param,
+                        loss_weighting=loss_weighting,
+                        t_min=ct_t_min,
+                        t_max=ct_t_max
+                    )
             except RuntimeError as e:
                 _t_fwd1=time.time()
                 if step<=step_base+2:
@@ -540,6 +742,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                             extra_dict={"kind":kind,"step":opt_steps,"emergency_checkpoint":emergency}
                         )
                     _write_summary(reason="oom")
+                    watchdog.stop()
                 raise
             raw_loss=out["loss"]
             _t_fwd1=time.time()
@@ -547,20 +750,34 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 _vram_post_fwd=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
                 print(f"[_run] FORWARD_DONE step={step} elapsed={_t_fwd1-_t_fwd0:.3f}s loss={float(raw_loss.detach().item()):.6f} vram_mb={_vram_post_fwd:.1f}",flush=True)
             if not bool(torch.isfinite(raw_loss).item()):
-                nan_happened=True
-                emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_nan_step_{opt_steps:05d}",optimizer=opt)
-                if tr is not None:
-                    tr.record_fallback(
-                        event="fallback",
-                        module="training",
-                        func="_run",
-                        action="emergency_checkpoint",
-                        reason="loss_nan_inf",
-                        extra_dict={"kind":kind,"step":opt_steps,"emergency_checkpoint":emergency}
-                    )
-                _write_summary(reason="nan_inf")
-                raise RuntimeError("loss_nan_inf")
+                nan_inf_count+=1
+                _nan_skip_streak+=1
+                _log(f"NAN_INF_DETECTED step={opt_steps} streak={_nan_skip_streak}/{_nan_skip_limit} total={nan_inf_count}")
+                if _nan_skip_streak>=_nan_skip_limit:
+                    nan_happened=True
+                    emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_nan_step_{opt_steps:05d}",optimizer=opt)
+                    if tr is not None:
+                        tr.record_fallback(
+                            event="fallback",
+                            module="training",
+                            func="_run",
+                            action="emergency_checkpoint",
+                            reason="loss_nan_inf_persistent",
+                            extra_dict={"kind":kind,"step":opt_steps,"emergency_checkpoint":emergency,"streak":_nan_skip_streak}
+                        )
+                    _write_summary(reason="nan_inf_persistent")
+                    watchdog.stop()
+                    raise RuntimeError(f"loss_nan_inf: {_nan_skip_streak} consecutive bad batches")
+                # Progressive recovery: skip this batch, zero grads, continue
+                opt.zero_grad(set_to_none=True)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             loss=raw_loss/float(grad_acc)
+            _nan_skip_streak=0  # reset streak on valid loss
+            # Watchdog heartbeat + signal state update
+            watchdog.heartbeat()
+            _signal_save_state["step"]=opt_steps
             if step<=step_base+2:
                 print(f"[_run] BACKWARD_START step={step}",flush=True)
             _t_bwd0=time.time()
@@ -572,6 +789,12 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             if step%grad_acc==0:
                 grad_norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),grad_clip_val))
                 clip_applied=bool(grad_norm>grad_clip_val)
+                # Gradient explosion detection: if grad_norm is extreme, skip this step
+                if not math.isfinite(grad_norm) or grad_norm>100*grad_clip_val:
+                    _log(f"GRAD_EXPLOSION grad_norm={grad_norm:.2f} threshold={100*grad_clip_val:.2f} — skipping optimizer step")
+                    opt.zero_grad(set_to_none=True)
+                    nan_inf_count+=1
+                    continue
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 opt_steps+=1
@@ -708,6 +931,8 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 if opt_steps==1 or opt_steps==max_steps or opt_steps%ckpt_every==0:
                     _save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"step_{opt_steps:05d}",optimizer=opt)
                     _prune_checkpoints(Path(ckpt_dir),keep_last)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 if opt_steps%eval_every==0 or opt_steps==max_steps:
                     ev=_periodic_eval(model,bundle.tokenizer,bundle.device,bundle.mask_id,cfg,seed=cfg.runtime.seed+opt_steps)
                     # P0.3: compute steps_to_converge per prompt, then average
@@ -716,18 +941,42 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     ev["kind"]=kind
                     ev["step"]=opt_steps
                     append_jsonl(eval_path,[ev])
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 if cooldown_every>0 and cooldown_seconds>0 and opt_steps<max_steps and opt_steps%cooldown_every==0:
                     _log(f"stage={row['stage']} cooldown_start step={opt_steps} sleep_sec={cooldown_seconds}")
                     if tr is not None:
                         tr.record_notice(module="training",func="_run",action="cooldown_sleep",reason="thermal_guard",extra_dict={"kind":kind,"step":opt_steps,"sleep_sec":cooldown_seconds})
                     time.sleep(float(cooldown_seconds))
                     _log(f"stage={row['stage']} cooldown_end step={opt_steps}")
+                # Reactive thermal protection: if GPU > _thermal_limit, pause until it cools
+                if opt_steps%10==0:
+                    _gpu_t=_gpu_temp_celsius()
+                    if _gpu_t is not None and _gpu_t>_thermal_limit:
+                        _log(f"THERMAL_THROTTLE gpu_temp={_gpu_t}C limit={_thermal_limit}C — pausing until cool")
+                        _cool_start=time.time()
+                        while True:
+                            time.sleep(15)
+                            watchdog.heartbeat()
+                            _gpu_t2=_gpu_temp_celsius()
+                            if _gpu_t2 is None or _gpu_t2<_thermal_limit-5:
+                                break
+                            if time.time()-_cool_start>300:
+                                _log(f"THERMAL_TIMEOUT gpu still {_gpu_t2}C after 5min — continuing anyway")
+                                break
+                        _log(f"THERMAL_RESUME gpu_temp={_gpu_t2}C cooldown_sec={time.time()-_cool_start:.0f}")
+                # Check signal interrupt
+                if _signal_save_state.get("requested"):
+                    _log(f"SIGNAL_INTERRUPT step={opt_steps} — stopping training")
+                    watchdog.stop()
+                    return _write_summary(reason="signal_interrupt")
                 if token_seen>=cfg.train.max_tokens:
                     break
         if token_seen>=cfg.train.max_tokens:
             break
         if len(loader)==0:
             break
+    watchdog.stop()
     summary=_write_summary(reason="normal")
     return summary
 
