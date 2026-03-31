@@ -153,6 +153,16 @@ class RuntimeConfig:
     dinfer_model_type:str="llada2-mini"
     dinfer_backend:str="vllm"
     force_dummy_model:bool=False
+    require_cuda_for_inference:bool=True
+    serialize_inference:bool=True
+    inference_lock_timeout_s:float=120.0
+    inference_log_ring_size:int=3000
+    inference_log_preview_chars:int=140
+    inference_sse_keepalive_s:int=10
+    dllm_stop_eos_enabled:bool=True
+    dllm_stop_plateau_patience:int=2
+    dllm_stop_plateau_delta_ratio:float=0.01
+    dllm_stop_cycle_enabled:bool=True
     run_id:str=""
     strict_fallbacks:bool=False
     fallback_whitelist:List[str]=field(default_factory=lambda:["flash_attention_unavailable","numpy_dll_unavailable","dinfer_missing"])

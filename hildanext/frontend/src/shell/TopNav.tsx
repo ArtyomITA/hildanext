@@ -3,8 +3,30 @@ import { NavLink } from "react-router-dom";
 import styles from "./TopNav.module.css";
 
 const ITEMS = [
-  { to: "/wsd", label: "WSD", sublabel: "Warmup / Stable / Decay" },
-  { to: "/inference", label: "Inference", sublabel: "AR vs diffusion" },
+  {
+    to: "/chat",
+    match: ["/chat", "/inference"],
+    label: "Inferenza",
+    sublabel: "Chat AR + dLLM",
+  },
+  {
+    to: "/inferenceplus",
+    match: ["/inferenceplus"],
+    label: "Inferenza+",
+    sublabel: "RCD + OTS Search",
+  },
+  {
+    to: "/benchmark",
+    match: ["/benchmark"],
+    label: "Benchmark",
+    sublabel: "Stage 0 Validation",
+  },
+  {
+    to: "/legacy/wsd",
+    match: ["/legacy/wsd", "/wsd"],
+    label: "WSD Legacy",
+    sublabel: "Run logs + diagnostica",
+  },
 ];
 
 export function TopNav({ pathname }: { pathname: string }) {
@@ -18,7 +40,7 @@ export function TopNav({ pathname }: { pathname: string }) {
         <div>
           <p className={styles.kicker}>HildaNext Observatory</p>
           <h1 className={styles.title}>
-            Frontend-only control room for WSD and diffusion inference
+            Studio chat-first per inferenza locale AR + dLLM
           </h1>
         </div>
       </div>
@@ -27,7 +49,10 @@ export function TopNav({ pathname }: { pathname: string }) {
           <NavLink
             key={item.to}
             className={({ isActive }) =>
-              clsx(styles.link, isActive || pathname === item.to ? styles.active : null)
+              clsx(
+                styles.link,
+                isActive || item.match.some((prefix) => pathname.startsWith(prefix)) ? styles.active : null,
+              )
             }
             to={item.to}
           >

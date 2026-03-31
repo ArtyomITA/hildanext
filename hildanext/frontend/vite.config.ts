@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5173,
+    port: 5174,
     proxy: {
       // Forward /api/* to the Python FastAPI server.
       "/api": {
@@ -29,6 +29,7 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: "./src/test/setup.ts",
+    include: ["src/test/**/*.{test,spec}.{ts,tsx}"],
     exclude: ["src/test/e2e/**"],
   },
 });

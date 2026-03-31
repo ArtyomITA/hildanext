@@ -1,0 +1,11 @@
+{
+  "label": "optimized",
+  "micro_batches": 20,
+  "wall_time_s": 218.62,
+  "avg_fwd_s": 1.687,
+  "avg_bwd_s": 9.119,
+  "avg_micro_batch_s": 10.807,
+  "tokens_per_sec": 93.7,
+  "peak_vram_mb": 3985.0,
+  "total_tokens": 20480
+}

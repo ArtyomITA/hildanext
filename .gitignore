@@ -1,7 +1,25 @@
 # =============================================================================
 # REPO PERSONALE — HildaNext
 # Tutto ciò che NON deve finire su git (solo il codice va versionato)
+#
+# STRATEGIA: escludiamo per categoria (binari, dati, cache, repo esterni,
+# file di sistema), mantenendo tutto il codice sotto hildanext/ versionato.
+# NON usiamo wildcard globali tipo `*` con whitelist parziale — bloccano
+# silenziosamente i file nuovi.
 # =============================================================================
+
+
+# =============================================================================
+# [REPO ROOT — file che non sono codice del progetto]
+# Paper, documenti scaricati, markdown di architettura di alto livello
+# =============================================================================
+/deep-research-report.md
+/Hilda NEXT Full Architecture.md
+/Safe Hilda Next Architecture.md
+/Plan Stage 0.md
+/Diffusion-Pretrained Dense and Contextual Embeddings.html
+/llada2_1_tech_report.html
+/LLaDA2.0_*.html
 
 
 # =============================================================================
@@ -10,8 +28,13 @@
 # Vanno completamente esclusi dal root repo per evitare push accidentali
 # su GitHub/HuggingFace di altri (ML-GSAI, Qwen, allenai, inclusionAI…)
 # =============================================================================
-LLaDA/
-Qwen3-0.6B/
+/LLaDA/
+/Qwen3-0.6B/
+/Codar/
+/Evo/
+/dolma_v1_6_sample_*/
+/research/
+/screenshots/
 hildanext/vendor/dinfer/
 hildanext/vendor/dolma_urls/
 hildanext/vendor/llada/
@@ -36,26 +59,18 @@ hildanext/vendor/llada/
 *.pb
 *.mlpackage
 *.mlmodel
-# Cartelle modelli scaricati
-models/qwen*/
-models/llada*/
-models/exports/
-hildanext/models/
-# File LFS
 *.lfs
+# Cartelle modelli
+hildanext/models/
+models/
 
 
 # =============================================================================
 # [DATASET / DATI GREZZI / FILE GRANDI]
 # Dati Dolma, Parquet, Arrow, HDF5 e simili non appartengono al VCS
 # =============================================================================
-dolma_v1_6_sample_*/
-hildanext/data/dolma/
-hildanext/data/processed/
-hildanext/data/tokenized/
-hildanext/data/raw/
-hildanext/data/curated/
-# Formati dati pesanti
+hildanext/data/
+# Formati dati pesanti (in qualsiasi cartella)
 *.parquet
 *.arrow
 *.feather
@@ -69,7 +84,7 @@ hildanext/data/curated/
 *.jsonl.gz
 *.txt.gz
 *.zst
-# Grandi archivi
+# Archivi
 *.tar
 *.tar.gz
 *.tar.bz2
@@ -83,20 +98,27 @@ hildanext/data/curated/
 # [ARTEFATTI DI ESECUZIONE — runs/, logs, cache]
 # Output di training, eval, cache temporanea
 # =============================================================================
-hildanext/runs/cache/
-hildanext/runs/logs/
-hildanext/runs/console/
-hildanext/runs/reports/
-hildanext/runs/_archive/
+hildanext/runs/
+hildanext/logs/
+hildanext/cpt/
+hildanext/reports/
+# Log files individuali
+hildanext/*.log
+hildanext/cpt_run.log
+# JSONL di training / eval (dati generati, non codice)
+hildanext/*.jsonl
+hildanext/*.summary.json
+# Documenti HTML generati nella /docs (paper convertiti)
+hildanext/docs/*.html
 hildanext/docs/reports/
+# PDF di paper
+hildanext/*.pdf
+hildanext/llada21_extracted/
+hildanext/llada21_extracted.txt
 # Tensorboard / wandb
-runs/
 wandb/
 lightning_logs/
 *.tfevents.*
-# Config effimeri generati automaticamente (tenere solo quelli scritti a mano)
-hildanext/runs/configs/*.auto.yaml
-hildanext/runs/configs/*.tmp.yaml
 
 
 # =============================================================================
@@ -105,35 +127,36 @@ hildanext/runs/configs/*.tmp.yaml
 .venv/
 venv/
 env/
-.env/
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyo
-# Build / dist
 *.egg-info/
 dist/
 build/
 *.egg
 MANIFEST
-# Type stubs generati
 *.pyi
-# Coverage & test cache
 .coverage
 .coverage.*
 htmlcov/
 .tox/
 .nox/
 .pytest_cache/
-*.tox
-# MyPy
 .mypy_cache/
 .dmypy.json
-# Ruff / linting cache
 .ruff_cache/
-# Jupyter
 .ipynb_checkpoints/
 *.ipynb
+
+
+# =============================================================================
+# [NODE / FRONTEND BUILD]
+# =============================================================================
+node_modules/
+hildanext/frontend/dist/
+hildanext/frontend/test-results/
+*.local
 
 
 # =============================================================================
@@ -151,17 +174,14 @@ htmlcov/
 # =============================================================================
 # [SISTEMA OPERATIVO]
 # =============================================================================
-# Windows
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
-# macOS
 .DS_Store
 .AppleDouble
 .LSOverride
 ._*
-# Linux
 *.bak
 *.tmp
 
@@ -173,6 +193,7 @@ $RECYCLE.BIN/
 .env
 .env.*
 !.env.example
+!hildanext/frontend/.env.development
 *.key
 *.pem
 *.p12
@@ -180,19 +201,3 @@ secrets/
 credentials/
 config/local*.yaml
 config/private*.yaml
-
-
-# =============================================================================
-# [HTML / REPORT TECNICI DI TERZI]
-# File HTML scaricati di paper / documenti esterni — non sono codice tuo
-# =============================================================================
-*.html
-llada2_1_tech_report.html
-LLaDA2.0_*.html
-
-
-*
-!hildanext/
-!hildanext/frontend/
-!hildanext/frontend/**
-Hilda NEXT Full Architecture.md

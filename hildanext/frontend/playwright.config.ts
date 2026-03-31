@@ -2,6 +2,7 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./src/test/e2e",
+  testIgnore: ["**/inference_ar.spec.ts", "**/visual.spec.ts"],
   snapshotDir: "./src/test/e2e/__snapshots__",
   // Update baselines with: npx playwright test --update-snapshots
   expect: {

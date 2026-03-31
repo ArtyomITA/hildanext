@@ -45,8 +45,10 @@ try{
  $env:HILDANEXT_DOLMA_DOC_INDEX_PATH=$DocIndexPath
  $env:PYTHONUNBUFFERED="1"
  # --- VRAM Lab optimal settings for GTX 1080 (8GB) ---
- # Reduce CUDA fragmentation with expandable segments
- $env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+ # Lazy CUDA module loading: reduces baseline VRAM ~100-200MB
+ $env:CUDA_MODULE_LOADING="LAZY"
+ # Reduce CUDA fragmentation with expandable segments + max_split_size cap for 8GB card
+ $env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
  # force_math_sdpa() is called automatically at model load (no FlashAttention on Pascal SM_61)
  $docIdxObj=Resolve-Path -Path $DocIndexPath -ErrorAction SilentlyContinue
  if(-not $docIdxObj){ throw "doc_index_path_missing path=$DocIndexPath" }
@@ -110,7 +112,7 @@ try{
   if($LASTEXITCODE -ne 0){ throw "preflight_wsd_failed exit=$LASTEXITCODE" }
  }
  $runArgs=@("-u","-m","hildanext.cli","run-wsd","--config",$OutConfig,"--skip-preflight")
- if($NoArchive){ $runArgs+="--no-archive" }
+ if($NoArchive -or $NoFromScratch){ $runArgs+="--no-archive" }
  Write-Line ("RUN python "+($runArgs -join " "))
  & $pyExe @runArgs
  if($LASTEXITCODE -ne 0){ throw "run_wsd_failed exit=$LASTEXITCODE" }

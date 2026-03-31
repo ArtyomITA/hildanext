@@ -17,6 +17,7 @@ import { GlossaryInspector } from "../../features/glossary/GlossaryInspector";
 import { InsightCallout } from "../../features/insights/InsightCallout";
 import { StickyFilterBar } from "../../features/logs/StickyFilterBar";
 import { useLogFeed } from "../../features/logs/useLogFeed";
+import { Stage0Validation } from "../../features/stage0/Stage0Validation";
 import { StatusRail } from "../../shell/StatusRail";
 import styles from "./WsdPage.module.css";
 
@@ -89,6 +90,7 @@ export function WsdPage() {
       <div className={styles.layout}>
         <div className={styles.primary}>
           <RunControlPanel />
+          <Stage0Validation />
 
           <Panel kicker="Schedule" title="Warmup -> stable -> decay">
             <PhaseTimeline metrics={wsd.metrics} ladderBlocks={wsd.meta.ladderBlocks} meta={wsd.meta} />

@@ -21,15 +21,34 @@ def seed_everything(seed:int)->None:
         torch.cuda.manual_seed_all(seed)
 
 def force_math_sdpa()->None:
-    """Configure SDPA backends for Pascal (sm_61).
+    """Configure SDPA backends and CUDA allocator for Pascal (sm_61).
     FlashAttention requires sm_80+ so it's disabled.
     mem_efficient (CUTLASS) works on sm_50+ and is faster than math — enable it.
     math is kept as fallback for ops where mem_efficient doesn't support the mask shape."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Torch was not compiled with flash attention.*",
+    )
+    os.environ.setdefault("CUDA_MODULE_LOADING","LAZY")
+    alloc_conf=(os.environ.get("PYTORCH_CUDA_ALLOC_CONF","") or "").strip()
+    if not alloc_conf:
+        if os.name=="nt":
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"]="max_split_size_mb:512"
+        else:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"]="expandable_segments:True,max_split_size_mb:512"
+    elif os.name=="nt" and "expandable_segments" in alloc_conf.lower():
+        # expandable_segments is not supported on Windows and emits a warning.
+        parts=[p.strip() for p in alloc_conf.split(",") if p.strip()]
+        parts=[p for p in parts if not p.lower().startswith("expandable_segments")]
+        if not any(p.lower().startswith("max_split_size_mb") for p in parts):
+            parts.append("max_split_size_mb:512")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"]=",".join(parts)
     if torch.cuda.is_available():
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(True)
         torch.backends.cudnn.benchmark=True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction=True
 
 def choose_device(device_hint:str="auto")->torch.device:
     if device_hint=="cpu":
@@ -148,7 +167,12 @@ class TinyCausalLM(nn.Module):
         super().__init__()
         self.embed=nn.Embedding(vocab_size,hidden_size)
         self.lm_head=nn.Linear(hidden_size,vocab_size,bias=False)
-    def forward(self,input_ids:torch.Tensor,attention_mask:torch.Tensor|None=None):
-        h=self.embed(input_ids)
+    def forward(self,input_ids:torch.Tensor|None=None,attention_mask:torch.Tensor|None=None,inputs_embeds:torch.Tensor|None=None,**kwargs):
+        if inputs_embeds is not None:
+            h=inputs_embeds
+        elif input_ids is not None:
+            h=self.embed(input_ids)
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
         logits=self.lm_head(h)
         return SimpleNamespace(logits=logits)

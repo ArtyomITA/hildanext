@@ -5,8 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass,field
 from pathlib import Path
 from typing import Any,Dict,Optional,Tuple,List
+import os
 import sys
 import time
+import gc
+import math as _math
 import torch
 from .config import AppConfig
 from .tokenization import load_tokenizer,ensure_mask_token
@@ -44,6 +47,55 @@ def _infer_param_dtype(model:Any)->str:
     except Exception:
         return "unknown"
 
+
+def _weight_shard_count(model_dir:str)->int:
+    p=Path(model_dir)
+    if not p.exists():
+        return 0
+    seen:set[str]=set()
+    for pat in [
+        "model-*.safetensors",
+        "pytorch_model-*.bin",
+        "model.safetensors",
+        "pytorch_model.bin",
+    ]:
+        for fp in p.glob(pat):
+            if fp.is_file():
+                seen.add(str(fp.resolve()))
+    return len(seen)
+
+
+def _configure_hf_parallel_loading(model_dir:str)->None:
+    shard_count=_weight_shard_count(model_dir)
+    if shard_count<2:
+        return
+    os.environ.setdefault("HF_ENABLE_PARALLEL_LOADING","true")
+    workers=max(1,min(8,shard_count))
+    os.environ.setdefault("HF_PARALLEL_LOADING_WORKERS",str(workers))
+
+
+def _from_pretrained_best_effort(AutoModelForCausalLM:Any,model_dir:str,dtype:Any,trust_remote_code:bool)->Any:
+    # Try safer/faster combinations first, then fall back for older stacks.
+    base={"trust_remote_code":trust_remote_code}
+    attempts=[
+        {**base,"local_files_only":True,"low_cpu_mem_usage":True,"use_safetensors":True},
+        {**base,"local_files_only":True,"low_cpu_mem_usage":True},
+        {**base,"local_files_only":True},
+        dict(base),
+    ]
+    last_err:Exception|None=None
+    for kwargs in attempts:
+        try:
+            try:
+                return AutoModelForCausalLM.from_pretrained(model_dir,dtype=dtype,**kwargs)
+            except TypeError:
+                return AutoModelForCausalLM.from_pretrained(model_dir,torch_dtype=dtype,**kwargs)
+        except Exception as e:
+            last_err=e
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("from_pretrained_failed")
+
 def load_model_bundle(cfg:AppConfig,for_training:bool=False,trace=None)->ModelBundle:
     tr=use_trace(cfg,trace)
     force_math_sdpa()
@@ -80,8 +132,13 @@ def load_model_bundle(cfg:AppConfig,for_training:bool=False,trace=None)->ModelBu
             try:
                 from transformers import AutoModelForCausalLM
                 td=dtype_from_name(cfg.train.dtype,device)
-                kwargs={"trust_remote_code":cfg.model.trust_remote_code,"dtype":td}
-                model=AutoModelForCausalLM.from_pretrained(cfg.paths.model_dir,**kwargs)
+                _configure_hf_parallel_loading(cfg.paths.model_dir)
+                model=_from_pretrained_best_effort(
+                    AutoModelForCausalLM,
+                    cfg.paths.model_dir,
+                    td,
+                    cfg.model.trust_remote_code,
+                )
                 model=model.to(device)
             except Exception as e:
                 reason=f"load_failed:{e}"
@@ -124,7 +181,7 @@ def load_model_bundle(cfg:AppConfig,for_training:bool=False,trace=None)->ModelBu
         model=TinyCausalLM(vocab_size=vocab,hidden_size=256).to(device)
     if for_training and cfg.train.grad_ckpt and hasattr(model,"gradient_checkpointing_enable"):
         try:
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False,"preserve_rng_state":False})
         except TypeError:
             try:
                 model.gradient_checkpointing_enable()
@@ -135,6 +192,11 @@ def load_model_bundle(cfg:AppConfig,for_training:bool=False,trace=None)->ModelBu
     if for_training and hasattr(model,"config") and hasattr(model.config,"use_cache"):
         try:
             model.config.use_cache=False
+        except Exception:
+            pass
+    if (not for_training) and hasattr(model,"config") and hasattr(model.config,"use_cache"):
+        try:
+            model.config.use_cache=True
         except Exception:
             pass
     mask_id=ensure_mask_token(tok,cfg.model.mask_token,model=model)
@@ -203,7 +265,16 @@ def mode_thresholds(cfg:AppConfig,mode:str,tau_mask:Optional[float],tau_edit:Opt
         return float(cfg.inference.q_mode_tau_mask),float(cfg.inference.q_mode_tau_edit)
     return float(cfg.inference.s_mode_tau_mask),float(cfg.inference.s_mode_tau_edit)
 
-def _predict_autoregressive_candidates(model:Any,seq:torch.Tensor,prompt_len:int,max_new:int,mask_id:int)->Tuple[torch.Tensor,torch.Tensor]:
+def _top1_with_confidence(logits:torch.Tensor)->Tuple[torch.Tensor,torch.Tensor]:
+    """Return (top1_prob, top1_id) without materializing full softmax."""
+    logits_fp32=logits.float()
+    topv,p=torch.max(logits_fp32,dim=-1)
+    lse=torch.logsumexp(logits_fp32,dim=-1)
+    c=torch.exp(topv-lse).to(torch.float32)
+    return c,p.to(torch.long)
+
+
+def _predict_autoregressive_candidates_full(model:Any,seq:torch.Tensor,prompt_len:int,max_new:int,mask_id:int)->Tuple[torch.Tensor,torch.Tensor]:
     work=seq.clone()
     pred=torch.zeros((1,max_new),dtype=torch.long,device=seq.device)
     conf=torch.zeros((1,max_new),dtype=torch.float32,device=seq.device)
@@ -214,13 +285,52 @@ def _predict_autoregressive_candidates(model:Any,seq:torch.Tensor,prompt_len:int
             prefix=work[:,:1]
         out=model(input_ids=prefix)
         logits=out.logits[:,-1,:]
-        probs=torch.softmax(logits,dim=-1)
-        c,p=torch.max(probs,dim=-1)
+        c,p=_top1_with_confidence(logits)
         pred[:,i]=p
         conf[:,i]=c
         if int(work[0,g].item())==int(mask_id):
             work[:,g]=p
     return pred,conf
+
+
+def _predict_autoregressive_candidates_cached(model:Any,seq:torch.Tensor,prompt_len:int,max_new:int,mask_id:int)->Tuple[torch.Tensor,torch.Tensor]:
+    """Faster candidate scan using KV-cache incremental decode."""
+    work=seq.clone()
+    pred=torch.zeros((1,max_new),dtype=torch.long,device=seq.device)
+    conf=torch.zeros((1,max_new),dtype=torch.float32,device=seq.device)
+    prefix=work[:,:prompt_len]
+    if prefix.shape[1]==0:
+        prefix=work[:,:1]
+    out=model(input_ids=prefix,use_cache=True)
+    logits=out.logits[:,-1,:]
+    past_kv=getattr(out,"past_key_values",None)
+    for i in range(max_new):
+        g=prompt_len+i
+        c,p=_top1_with_confidence(logits)
+        pred[:,i]=p
+        conf[:,i]=c
+        if int(work[0,g].item())==int(mask_id):
+            next_tok=p.view(1,1)
+            work[:,g]=p
+        else:
+            next_tok=work[:,g].view(1,1)
+        if i+1>=max_new:
+            break
+        if past_kv is None:
+            # Some models may ignore cache; fallback to growing-prefix step.
+            out=model(input_ids=work[:,:g+1],use_cache=True)
+        else:
+            out=model(input_ids=next_tok,past_key_values=past_kv,use_cache=True)
+        logits=out.logits[:,-1,:]
+        past_kv=getattr(out,"past_key_values",None)
+    return pred,conf
+
+
+def _predict_autoregressive_candidates(model:Any,seq:torch.Tensor,prompt_len:int,max_new:int,mask_id:int)->Tuple[torch.Tensor,torch.Tensor]:
+    try:
+        return _predict_autoregressive_candidates_cached(model,seq,prompt_len,max_new,mask_id)
+    except Exception:
+        return _predict_autoregressive_candidates_full(model,seq,prompt_len,max_new,mask_id)
 
 def _decode_text(tok:Any,out_ids:torch.Tensor,mask_id:int,is_dummy:bool)->str:
     text=""
@@ -244,7 +354,21 @@ class BaseEngine:
         self.cfg=cfg
         self.trace=use_trace(cfg,trace)
         self.last_stats:Dict[str,Any]={}
-    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None,effort:str="medium")->str:
+    def generate(
+        self,
+        prompt:str,
+        mode:str="S_MODE",
+        tau_mask:float|None=None,
+        tau_edit:float|None=None,
+        max_new_tokens:int|None=None,
+        seed:int|None=None,
+        effort:str="medium",
+        temperature:float|None=None,
+        top_p:float|None=None,
+        top_k:int|None=None,
+        presence_penalty:float|None=None,
+        repetition_penalty:float|None=None,
+    )->str:
         raise NotImplementedError
     def close(self)->None:
         return
@@ -255,7 +379,21 @@ class TransformersEngine(BaseEngine):
         super().__init__(cfg,trace=trace)
         self.bundle=load_model_bundle(cfg,for_training=False,trace=self.trace)
         self.fallback_reason=fallback_reason or self.bundle.load_reason
-    def _decode(self,prompt:str,mode:str,tau_mask:float|None,tau_edit:float|None,max_new_tokens:int|None,seed:int|None,effort:str="medium")->str:
+    def _decode(
+        self,
+        prompt:str,
+        mode:str,
+        tau_mask:float|None,
+        tau_edit:float|None,
+        max_new_tokens:int|None,
+        seed:int|None,
+        effort:str="medium",
+        temperature:float|None=None,
+        top_p:float|None=None,
+        top_k:int|None=None,
+        presence_penalty:float|None=None,
+        repetition_penalty:float|None=None,
+    )->str:
         if seed is None:
             seed=self.cfg.runtime.seed
         seed_everything(seed)
@@ -267,6 +405,13 @@ class TransformersEngine(BaseEngine):
         model=self.bundle.model
         device=self.bundle.device
         mask_id=self.bundle.mask_id
+        eos_token_id_raw=getattr(tok,"eos_token_id",None)
+        eos_token_id:int|None=None
+        if eos_token_id_raw is not None:
+            try:
+                eos_token_id=int(eos_token_id_raw)
+            except Exception:
+                eos_token_id=None
         enc=tok([prompt],return_tensors="pt")
         input_ids=enc["input_ids"].to(device)
         prompt_len=int(input_ids.shape[1])
@@ -276,12 +421,31 @@ class TransformersEngine(BaseEngine):
         logs=[]
         t0=time.time()
         model.eval()
+        if device.type=="cuda":
+            try:
+                torch.cuda.reset_peak_memory_stats(device.index or 0)
+            except Exception:
+                pass
         zero_gamma_streak=0
         patience=max(1,int(self.cfg.inference.degenerate_patience))
         strict=bool(self.cfg.inference.strict_decode_invariants)
         allow_fallback=bool(self.cfg.inference.allow_tau_fallback_on_degenerate)
         steps=eff_steps  # effort-resolved step budget overrides config
-        with torch.no_grad():
+        converged=False
+        eos_guard_enabled=bool(getattr(self.cfg.runtime,"dllm_stop_eos_enabled",True))
+        plateau_patience=max(1,int(getattr(self.cfg.runtime,"dllm_stop_plateau_patience",2)))
+        plateau_delta_ratio=max(0.0,float(getattr(self.cfg.runtime,"dllm_stop_plateau_delta_ratio",0.01)))
+        plateau_delta_max=max(1,int(_math.ceil(float(max_new)*plateau_delta_ratio)))
+        cycle_guard_enabled=bool(getattr(self.cfg.runtime,"dllm_stop_cycle_enabled",True))
+        step_callback=getattr(self.cfg.runtime,"inference_step_callback",None)
+        if not callable(step_callback):
+            step_callback=None
+        plateau_streak=0
+        seen_complete_hashes:set[int]=set()
+        stop_guard_triggered=False
+        stop_guard_reason=""
+        eos_cut_idx:int|None=None
+        with torch.inference_mode():
             for step in range(steps):
                 gen_before=seq[:,prompt_len:]
                 pred,conf=_predict_autoregressive_candidates(model,seq,prompt_len,max_new,mask_id)
@@ -304,6 +468,11 @@ class TransformersEngine(BaseEngine):
                     "tau_edit":float(tau_e)
                 }
                 logs.append(row)
+                if step_callback is not None:
+                    try:
+                        step_callback(dict(row))
+                    except Exception:
+                        pass
                 if sets.gamma_count==0:
                     zero_gamma_streak+=1
                 else:
@@ -349,15 +518,63 @@ class TransformersEngine(BaseEngine):
                             "fallback_reason":self.fallback_reason,
                             "dummy_model":self.bundle.is_dummy,
                             "load_reason":self.bundle.load_reason,
+                            "device":self.bundle.device.type,
+                            "actual_dtype":self.bundle.actual_dtype,
+                            "finish_reason":"error",
+                            "truncated":False,
+                            "stop_guard_triggered":False,
+                            "stop_guard_reason":"",
+                            "tokens_generated":0,
                             "env_issues":self.bundle.env_issues,
                             "fallbacks":self.trace.snapshot_fallbacks(limit=64) if self.trace is not None else [],
                             "error":"degenerate decoding"
                         }
                         raise RuntimeError("degenerate decoding: gamma_count stayed 0")
+                complete_tokens=updated[0]
+                if eos_guard_enabled and eos_token_id is not None:
+                    eos_positions=(complete_tokens==int(eos_token_id)).nonzero(as_tuple=False)
+                    if int(eos_positions.numel())>0:
+                        eos_cut_idx=int(eos_positions[0][0].item())
+                        stop_guard_triggered=True
+                        stop_guard_reason="eos"
+                        logs[-1]["stop_guard_triggered"]=True
+                        logs[-1]["stop_guard_reason"]=stop_guard_reason
+                        converged=True
+                        break
+                if remain==0.0:
+                    if int(sets.delta_count)<=plateau_delta_max:
+                        plateau_streak+=1
+                    else:
+                        plateau_streak=0
+                    if plateau_streak>=plateau_patience:
+                        stop_guard_triggered=True
+                        stop_guard_reason="plateau"
+                        logs[-1]["stop_guard_triggered"]=True
+                        logs[-1]["stop_guard_reason"]=stop_guard_reason
+                        converged=True
+                        break
+                    if cycle_guard_enabled:
+                        sig=hash(tuple(int(x) for x in complete_tokens.detach().cpu().tolist()))
+                        if sig in seen_complete_hashes:
+                            stop_guard_triggered=True
+                            stop_guard_reason="cycle"
+                            logs[-1]["stop_guard_triggered"]=True
+                            logs[-1]["stop_guard_reason"]=stop_guard_reason
+                            converged=True
+                            break
+                        seen_complete_hashes.add(sig)
+                else:
+                    plateau_streak=0
+                    if cycle_guard_enabled:
+                        seen_complete_hashes.clear()
                 if remain==0.0 and sets.delta_count==0:
+                    converged=True
                     break
         elapsed=max(1e-6,time.time()-t0)
         out_ids=seq[0,prompt_len:]
+        if eos_cut_idx is not None:
+            out_ids=out_ids[:max(0,eos_cut_idx+1)]
+        tokens_generated=int((out_ids!=int(mask_id)).sum().item()) if int(out_ids.numel())>0 else 0
         text=_decode_text(tok,out_ids,mask_id,self.bundle.is_dummy)
         # P0.3 metrics
         stc=next((l["step"] for l in logs if l.get("mask_ratio",1.0)==0.0),len(logs))
@@ -367,6 +584,7 @@ class TransformersEngine(BaseEngine):
                 vram_peak=float(torch.cuda.max_memory_allocated(self.bundle.device.index or 0))
             except Exception:
                 pass
+        finish_reason=stop_guard_reason if stop_guard_reason else ("converged" if converged else "length")
         self.last_stats={
             "engine":self.name,
             "mode":mode,
@@ -376,21 +594,73 @@ class TransformersEngine(BaseEngine):
             "steps":len(logs),
             "steps_to_converge":stc,
             "logs":logs,
-            "tokens_per_sec":tokens_per_second(int(max_new),elapsed),
+            "tokens_generated":tokens_generated,
+            "tokens_per_sec":tokens_per_second(tokens_generated,elapsed),
             "vram_peak_bytes":vram_peak,
             "json_valid_rate":None,
             "fallback_reason":self.fallback_reason,
             "dummy_model":self.bundle.is_dummy,
             "load_reason":self.bundle.load_reason,
+            "device":self.bundle.device.type,
             "model_name_or_path":self.bundle.model_name_or_path,
             "requested_dtype":self.bundle.requested_dtype,
             "actual_dtype":self.bundle.actual_dtype,
+            "finish_reason":finish_reason,
+            "truncated":True if finish_reason=="length" else False,
+            "stop_guard_triggered":stop_guard_triggered,
+            "stop_guard_reason":stop_guard_reason,
             "env_issues":self.bundle.env_issues,
             "fallbacks":self.trace.snapshot_fallbacks(limit=64) if self.trace is not None else []
         }
         return text.strip()
-    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None,effort:str="medium")->str:
-        return self._decode(prompt,mode,tau_mask,tau_edit,max_new_tokens,seed,effort=effort)
+    def generate(
+        self,
+        prompt:str,
+        mode:str="S_MODE",
+        tau_mask:float|None=None,
+        tau_edit:float|None=None,
+        max_new_tokens:int|None=None,
+        seed:int|None=None,
+        effort:str="medium",
+        temperature:float|None=None,
+        top_p:float|None=None,
+        top_k:int|None=None,
+        presence_penalty:float|None=None,
+        repetition_penalty:float|None=None,
+    )->str:
+        return self._decode(
+            prompt,
+            mode,
+            tau_mask,
+            tau_edit,
+            max_new_tokens,
+            seed,
+            effort=effort,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
+        )
+    def close(self)->None:
+        try:
+            if hasattr(self,"bundle") and self.bundle is not None:
+                if hasattr(self.bundle,"model"):
+                    del self.bundle.model
+                if hasattr(self.bundle,"tokenizer"):
+                    del self.bundle.tokenizer
+                self.bundle=None
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 class DInferEngine(BaseEngine):
     name="dinfer"
@@ -439,7 +709,21 @@ class DInferEngine(BaseEngine):
                 self.server.stop_serving()
         except Exception:
             pass
-    def generate(self,prompt:str,mode:str="S_MODE",tau_mask:float|None=None,tau_edit:float|None=None,max_new_tokens:int|None=None,seed:int|None=None,effort:str="medium")->str:
+    def generate(
+        self,
+        prompt:str,
+        mode:str="S_MODE",
+        tau_mask:float|None=None,
+        tau_edit:float|None=None,
+        max_new_tokens:int|None=None,
+        seed:int|None=None,
+        effort:str="medium",
+        temperature:float|None=None,
+        top_p:float|None=None,
+        top_k:int|None=None,
+        presence_penalty:float|None=None,
+        repetition_penalty:float|None=None,
+    )->str:
         tau_m,_=mode_thresholds(self.cfg,mode,tau_mask,tau_edit)
         eff_steps,tau_m,_=_resolve_effort(effort,8,tau_m,tau_m)
         if hasattr(self.server,"sample_params"):
@@ -449,14 +733,36 @@ class DInferEngine(BaseEngine):
                 pass
         max_new=int(max_new_tokens or self.cfg.inference.max_new_tokens)
         x=self.tokenizer([prompt],return_tensors="pt")["input_ids"]
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
         t0=time.time()
-        out=self.server.generate(x,gen_length=max_new,block_length=self.cfg.inference.block_size)
+        with torch.inference_mode():
+            out=self.server.generate(x,gen_length=max_new,block_length=self.cfg.inference.block_size)
         elapsed=max(1e-6,time.time()-t0)
         prompt_len=int(x.shape[1])
         text=self.tokenizer.decode(out[0,prompt_len:],skip_special_tokens=True)
         if not text.strip():
             text="[DUMMY] dummy-output"
-        self.last_stats={"engine":self.name,"mode":mode,"effort":effort,"tau_mask":tau_m,"tau_edit":tau_mask,"steps":-1,"steps_to_converge":None,"tokens_per_sec":tokens_per_second(int(max_new),elapsed),"vram_peak_bytes":None,"json_valid_rate":None,"fallbacks":self.trace.snapshot_fallbacks(limit=64) if self.trace is not None else []}
+        self.last_stats={
+            "engine":self.name,
+            "mode":mode,
+            "effort":effort,
+            "tau_mask":tau_m,
+            "tau_edit":tau_mask,
+            "steps":-1,
+            "steps_to_converge":None,
+            "tokens_per_sec":tokens_per_second(int(max_new),elapsed),
+            "vram_peak_bytes":None,
+            "json_valid_rate":None,
+            "device":"cuda" if torch.cuda.is_available() else "cpu",
+            "actual_dtype":"unknown",
+            "finish_reason":"length",
+            "truncated":True,
+            "fallbacks":self.trace.snapshot_fallbacks(limit=64) if self.trace is not None else [],
+        }
         return text.strip()
 
 def build_engine(cfg:AppConfig,trace=None)->BaseEngine:

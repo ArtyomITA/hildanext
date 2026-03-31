@@ -1,13 +1,19 @@
 import { test, expect } from "@playwright/test";
 
-test("wsd page loads", async ({ page }) => {
-  await page.goto("/wsd");
-  await expect(page.getByText("Warmup -> stable -> decay")).toBeVisible();
-  await expect(page.getByText("Virtualized log window")).toBeVisible();
+test("root redirects to chat studio", async ({ page }) => {
+  await page.goto("/");
+  await expect(page).toHaveURL(/\/chat$/);
+  await expect(page.getByText("Chat-First Inference Studio")).toBeVisible();
+  await expect(page.getByRole("button", { name: /nuova chat/i })).toBeVisible();
 });
 
-test("inference page loads", async ({ page }) => {
+test("/inference alias redirects to chat", async ({ page }) => {
   await page.goto("/inference");
-  await expect(page.getByText("AR lane vs diffusion lane")).toBeVisible();
-  await expect(page.getByText("Canvas-based token state replay")).toBeVisible();
+  await expect(page).toHaveURL(/\/chat$/);
+  await expect(page.getByText("Chat-First Inference Studio")).toBeVisible();
+});
+
+test("legacy wsd route remains directly reachable", async ({ page }) => {
+  await page.goto("/legacy/wsd");
+  await expect(page.getByText("Warmup -> stable -> decay")).toBeVisible();
 });

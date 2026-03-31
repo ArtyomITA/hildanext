@@ -1,0 +1,488 @@
+.page {
+  display: grid;
+  grid-template-columns: minmax(0, 1.8fr) minmax(320px, 0.9fr);
+  gap: 1rem;
+  min-height: calc(100vh - 220px);
+}
+
+.timeline,
+.config {
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: linear-gradient(180deg, rgba(9, 20, 30, 0.92), rgba(7, 14, 24, 0.94));
+  box-shadow: var(--shadow);
+}
+
+.timeline {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 0;
+}
+
+.timelineHead {
+  padding: 1rem 1rem 0.5rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: baseline;
+}
+
+.timelineHead h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.3rem;
+}
+
+.timelineHead div {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.timelineHead span {
+  padding: 0.28rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(63, 224, 255, 0.12);
+  border: 1px solid rgba(63, 224, 255, 0.25);
+  color: var(--text-soft);
+  font-size: 0.72rem;
+}
+
+.turns {
+  overflow: auto;
+  padding: 0.5rem 1rem;
+  display: grid;
+  gap: 0.9rem;
+  align-content: start;
+}
+
+.emptyTimeline {
+  margin: 0.75rem 0;
+  color: var(--text-dim);
+}
+
+.turnCard {
+  display: grid;
+  gap: 0.7rem;
+  align-content: start;
+}
+
+.userBubble {
+  justify-self: end;
+  align-self: start;
+  width: fit-content;
+  max-width: min(90%, 780px);
+  border-radius: 16px 16px 4px 16px;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid rgba(201, 255, 68, 0.34);
+  background: linear-gradient(150deg, rgba(201, 255, 68, 0.16), rgba(113, 154, 16, 0.06));
+}
+
+.userBubble small {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.67rem;
+}
+
+.userBubble p {
+  margin: 0.35rem 0 0;
+  line-height: 1.5;
+}
+
+.assistantBlock {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 0.8rem;
+  background: rgba(8, 16, 25, 0.72);
+}
+
+.assistantHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.8rem;
+}
+
+.assistantHead strong {
+  color: var(--text);
+}
+
+.assistantHead span {
+  color: var(--text-soft);
+}
+
+.laneCard {
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  padding: 0.75rem;
+}
+
+.laneSuccess {
+  background: linear-gradient(180deg, rgba(0, 194, 184, 0.12), rgba(0, 194, 184, 0.03));
+}
+
+.laneError {
+  background: linear-gradient(180deg, rgba(255, 102, 123, 0.16), rgba(255, 102, 123, 0.05));
+}
+
+.laneCard header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.55rem;
+}
+
+.laneCard header strong {
+  font-size: 0.9rem;
+}
+
+.laneCard header small {
+  color: var(--text-soft);
+}
+
+.laneCard p {
+  margin: 0 0 0.75rem;
+  line-height: 1.5;
+  color: var(--text-soft);
+}
+
+.laneCard dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem 0.7rem;
+}
+
+.laneCard dt {
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+}
+
+.laneCard dd {
+  margin: 0.1rem 0 0;
+}
+
+.diagnostics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+
+.diagBadge {
+  border-radius: 999px;
+  padding: 0.14rem 0.48rem;
+  font-size: 0.67rem;
+  border: 1px solid rgba(63, 224, 255, 0.38);
+  color: #d8f5ff;
+  background: rgba(63, 224, 255, 0.18);
+}
+
+.composer {
+  border-top: 1px solid var(--line);
+  padding: 0.8rem;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.6rem;
+}
+
+.composerField {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.composer textarea {
+  resize: vertical;
+  min-height: 70px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(4, 11, 18, 0.82);
+  color: var(--text);
+  padding: 0.65rem 0.75rem;
+}
+
+.composer textarea:disabled {
+  opacity: 0.72;
+}
+
+.composer button {
+  border: 1px solid rgba(63, 224, 255, 0.4);
+  background: linear-gradient(150deg, rgba(63, 224, 255, 0.22), rgba(0, 194, 184, 0.12));
+  color: var(--text);
+  border-radius: 14px;
+  padding: 0.6rem 1rem;
+  font-weight: 600;
+}
+
+.composer button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.config {
+  padding: 1rem;
+  display: grid;
+  gap: 0.8rem;
+  align-content: start;
+  overflow: auto;
+}
+
+.block {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 0.8rem;
+  background: rgba(6, 13, 21, 0.82);
+  display: grid;
+  gap: 0.55rem;
+}
+
+.block h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.modeSelector {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.modeBtn {
+  flex: 1;
+  border: none;
+  background: rgba(6, 12, 20, 0.78);
+  color: var(--text-soft);
+  padding: 0.55rem 0.75rem;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.modeBtn:first-child {
+  border-radius: 999px 0 0 999px;
+}
+
+.modeBtn:last-child {
+  border-radius: 0 999px 999px 0;
+}
+
+.modeBtnActive {
+  background: linear-gradient(150deg, rgba(63, 224, 255, 0.28), rgba(0, 194, 184, 0.18));
+  color: var(--text);
+  border-color: rgba(63, 224, 255, 0.5);
+}
+
+.fieldRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.field {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.field label {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.field input,
+.field select {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(6, 12, 20, 0.78);
+  color: var(--text);
+  padding: 0.5rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.turnRunning {
+  margin: 0;
+  color: var(--text-soft);
+}
+
+/* ── Load Weights ── */
+.loadLead {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.loadStateCard {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.48rem 0.55rem;
+  background: rgba(10, 18, 28, 0.72);
+  display: grid;
+  gap: 0.35rem;
+}
+
+.loadStateCard p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.76rem;
+}
+
+.loadStateHead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.loadBadge {
+  border-radius: 999px;
+  padding: 0.18rem 0.52rem;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--line);
+}
+
+.loadIdle {
+  color: var(--text-dim);
+  background: rgba(120, 135, 157, 0.16);
+}
+
+.loadLoading {
+  color: #d6f2ff;
+  background: rgba(63, 224, 255, 0.18);
+  border-color: rgba(63, 224, 255, 0.4);
+}
+
+.loadLoaded {
+  color: #d7ffd4;
+  background: rgba(57, 173, 68, 0.26);
+  border-color: rgba(57, 173, 68, 0.45);
+}
+
+.loadOffline {
+  color: #ffe3bb;
+  background: rgba(255, 182, 72, 0.22);
+  border-color: rgba(255, 182, 72, 0.5);
+}
+
+.loadError {
+  color: #ffd2da;
+  background: rgba(255, 102, 123, 0.2);
+  border-color: rgba(255, 102, 123, 0.5);
+}
+
+.loadBtn {
+  border: 1px solid rgba(63, 224, 255, 0.4);
+  background: linear-gradient(150deg, rgba(63, 224, 255, 0.22), rgba(0, 194, 184, 0.12));
+  color: var(--text);
+  border-radius: 12px;
+  padding: 0.55rem 0.68rem;
+  font-weight: 600;
+}
+
+.loadBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.cpuWarn {
+  margin: 0;
+  color: #ffd9a6;
+  font-size: 0.78rem;
+}
+
+.loadFeedback {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.composerLock {
+  margin: 0.25rem 0 0;
+  color: #ffd9a6;
+  font-size: 0.74rem;
+}
+
+/* ── Inference Realtime Log ── */
+.logMetaLine {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.76rem;
+}
+
+.inferLogViewport {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(3, 9, 15, 0.86);
+  min-height: 140px;
+  max-height: 280px;
+  overflow: auto;
+  padding: 0.5rem;
+  display: grid;
+  gap: 0.45rem;
+  align-content: start;
+}
+
+.inferLogEmpty {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+.inferLogRow {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(10, 18, 28, 0.72);
+  padding: 0.45rem 0.5rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.inferLogRow[data-level="warning"] {
+  border-color: rgba(255, 182, 72, 0.45);
+}
+
+.inferLogRow[data-level="error"] {
+  border-color: rgba(255, 102, 123, 0.5);
+}
+
+.inferLogHead {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.inferLogMessage {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--text-soft);
+  line-height: 1.35;
+}
+
+.inferLogDetails summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 0.72rem;
+}
+
+.inferLogDetails pre {
+  margin: 0.35rem 0 0;
+  font-size: 0.72rem;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+}

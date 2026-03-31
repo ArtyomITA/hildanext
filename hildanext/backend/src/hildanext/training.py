@@ -17,7 +17,7 @@ from torch.utils.data import Dataset,DataLoader
 from torch.optim import AdamW
 from .config import AppConfig
 from .io_utils import read_jsonl,append_jsonl,write_json,ensure_dir
-from .diffusion import compute_m2t_t2t_losses,wsd_block,apply_remask
+from .diffusion import compute_m2t_t2t_losses,wsd_block,apply_remask,_install_embed_noise_hook,_remove_embed_noise_hook,set_embed_noise_std,reset_sdpa_probe
 from .inference import load_model_bundle
 from .tokenization import ensure_mask_token
 from .formulas import llada21_apply
@@ -75,9 +75,21 @@ class _TrainingWatchdog:
                         pass
                 self._last_beat=time.time()  # reset to avoid spamming
 
-# --- GPU thermal query (nvidia-smi) ---
+# --- GPU thermal query (pynvml, 65x faster than nvidia-smi subprocess) ---
+_nvml_inited=False
 def _gpu_temp_celsius()->Optional[int]:
-    """Try to read GPU temperature via nvidia-smi. Returns None if unavailable."""
+    """Read GPU temperature via pynvml. Falls back to nvidia-smi if pynvml unavailable."""
+    global _nvml_inited
+    try:
+        import pynvml
+        if not _nvml_inited:
+            pynvml.nvmlInit()
+            _nvml_inited=True
+        handle=pynvml.nvmlDeviceGetHandleByIndex(0)
+        return pynvml.nvmlDeviceGetTemperature(handle,pynvml.NVML_TEMPERATURE_GPU)
+    except Exception:
+        pass
+    # Fallback: nvidia-smi subprocess (slow, ~48ms per call)
     try:
         import subprocess
         r=subprocess.run(["nvidia-smi","--query-gpu=temperature.gpu","--format=csv,noheader,nounits"],capture_output=True,text=True,timeout=5)
@@ -204,13 +216,17 @@ def _collate(batch:List[Dict[str,Any]])->Dict[str,torch.Tensor]:
     resp=torch.tensor([x.get("response_mask",[0]*len(x["input_ids"])) for x in batch],dtype=torch.long)
     return {"input_ids":ids,"doc_ids":docs,"attention_mask":attn,"response_mask":resp}
 
-def _save_checkpoint(model,tokenizer,out_dir:Path,tag:str,optimizer=None)->str:
+def _save_checkpoint(model,tokenizer,out_dir:Path,tag:str,optimizer=None,watchdog=None)->str:
     ckpt=out_dir/tag
     ckpt.mkdir(parents=True,exist_ok=True)
     saved_via="unknown"
+    if watchdog is not None:
+        watchdog.heartbeat()
     if hasattr(model,"save_pretrained"):
         try:
             model.save_pretrained(str(ckpt))
+            if watchdog is not None:
+                watchdog.heartbeat()
             if hasattr(tokenizer,"save_pretrained"):
                 tokenizer.save_pretrained(str(ckpt))
             saved_via="save_pretrained"
@@ -230,12 +246,16 @@ def _save_checkpoint(model,tokenizer,out_dir:Path,tag:str,optimizer=None)->str:
     else:
         torch.save({"state_dict":model.state_dict()},ckpt/"model.pt")
         saved_via="torch_save"
+    if watchdog is not None:
+        watchdog.heartbeat()
     # Save optimizer state for proper resume (AdamW8bit momentum/statistics)
     if optimizer is not None:
         try:
             torch.save(optimizer.state_dict(),ckpt/"optimizer.pt")
         except Exception as e:
             logging.warning("optimizer state save failed for tag=%s: %s",tag,e)
+    if watchdog is not None:
+        watchdog.heartbeat()
     print(f"[checkpoint] saved {tag} via={saved_via} path={ckpt}",flush=True)
     return str(ckpt)
 
@@ -302,9 +322,12 @@ def _load_checkpoint_model(cfg:AppConfig,model,ckpt_path:Path,device:torch.devic
             return model
     try:
         from transformers import AutoModelForCausalLM
-        m=AutoModelForCausalLM.from_pretrained(str(ckpt_path),trust_remote_code=cfg.model.trust_remote_code)
+        m=AutoModelForCausalLM.from_pretrained(str(ckpt_path),trust_remote_code=cfg.model.trust_remote_code,torch_dtype=model.dtype)
+        # Copy weights into existing model on GPU instead of creating a second GPU copy
+        model.load_state_dict(m.state_dict(),strict=False)
+        del m
         print(f"[resume] model loaded via from_pretrained from {ckpt_path}",flush=True)
-        return m.to(device)
+        return model
     except Exception as e:
         logging.warning("checkpoint from_pretrained failed at %s: %s — resuming from base model",ckpt_path,e)
         if tr is not None:
@@ -328,6 +351,7 @@ def _load_optimizer_state(optimizer,ckpt_path:Path,device:torch.device)->bool:
     try:
         opt_state=torch.load(op,map_location=device)
         optimizer.load_state_dict(opt_state)
+        del opt_state
         print(f"[resume] optimizer state restored from {op}",flush=True)
         return True
     except Exception as e:
@@ -395,7 +419,8 @@ def _make_optimizer(model,cfg:AppConfig,device:torch.device,trace=None,kind:str=
             reason="optimizer_unknown",
             extra_dict={"requested":name,"used":"AdamW"}
         )
-    return AdamW(model.parameters(),lr=lr,weight_decay=wd,betas=betas),"AdamW"
+    _fused=device.type=="cuda"
+    return AdamW(model.parameters(),lr=lr,weight_decay=wd,betas=betas,fused=_fused),"AdamW(fused)" if _fused else "AdamW"
 
 def _decode_safe(tokenizer,ids:torch.Tensor,mask_id:int,dummy:bool=False)->str:
     txt=""
@@ -415,7 +440,7 @@ def _periodic_eval(model,tokenizer,device:torch.device,mask_id:int,cfg:AppConfig
     prompts=list(cfg.recipe.eval_prompts or ["Write one sentence about rain.","Q: 5+7? A:","Complete safely: The quick brown fox"])
     rows=[]
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         max_new=min(24,int(cfg.inference.max_new_tokens))
         for i,p in enumerate(prompts[:3]):
             seed_everything(seed+i)
@@ -514,8 +539,18 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     bundle=load_model_bundle(cfg,for_training=True,trace=tr)
     _t_ml1=time.time()
     _vram_after_model=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
-    print(f"[_run] MODEL_LOAD_DONE elapsed={_t_ml1-_t_ml0:.1f}s vram_after_mb={_vram_after_model:.1f} model_vram_mb={_vram_after_model-_vram_before_model:.1f} dummy={bundle.is_dummy} dtype={bundle.actual_dtype}",flush=True)
+    print(f"[_run] MODEL_LOAD_DONE elapsed={_t_ml1-_t_ml0:.1f}s vram_after_mb={_vram_after_model:.1f} model_vram_mb={_vram_after_model-_vram_before_model:.1f} dtype={bundle.actual_dtype}",flush=True)
     ensure_mask_token(bundle.tokenizer,cfg.model.mask_token,model=bundle.model)
+    # ---- P0: hard-cap VRAM to prevent Windows shared memory spill (freeze fix) ----
+    if torch.cuda.is_available() and cfg.train.max_vram_pct<1.0:
+        try:
+            _cap_device=bundle.device.index if bundle.device.index is not None else 0
+            torch.cuda.set_per_process_memory_fraction(cfg.train.max_vram_pct,device=_cap_device)
+            _total_vram_mb=torch.cuda.get_device_properties(bundle.device).total_memory/1024/1024
+            _cap_mb=_total_vram_mb*cfg.train.max_vram_pct
+            print(f"[_run] VRAM_CAP set={cfg.train.max_vram_pct:.0%} total={_total_vram_mb:.0f}MB cap={_cap_mb:.0f}MB",flush=True)
+        except Exception as _e:
+            print(f"[_run] VRAM_CAP_FAILED error={_e}",flush=True)
     model=bundle.model
     model.train()
     # ---- optimizer ----
@@ -604,6 +639,10 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             resumed_from=str(last_ckpt)
             if tr is not None:
                 tr.record_notice(module="training",func="_run",action="resume",reason="resumed_from_checkpoint",extra_dict={"kind":kind,"step":last_step,"path":resumed_from})
+            # Free temporary tensors from checkpoint loading
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     oom_happened=False
     nan_happened=False
     epoch=0
@@ -612,7 +651,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     _log(f"  optimizer={opt_name} lr={lr_base} lr_warmup={lr_warmup} lr_min_ratio={lr_min_ratio} grad_clip={grad_clip_val} wd={cfg.train.weight_decay}")
     _log(f"  shift_mode={shift_mode} time_param={time_param} loss_weighting={loss_weighting} attention_mode={attn_mode} bidir_verified={bidir_verified}")
     _log(f"  t_min={ct_t_min} t_max={ct_t_max} mask_ratio_discrete={cfg.train.mask_ratio}")
-    _log(f"  model={bundle.model_name_or_path} dtype={bundle.actual_dtype} device={bundle.device} dummy={bundle.is_dummy}")
+    _log(f"  model={bundle.model_name_or_path} dtype={bundle.actual_dtype} device={bundle.device}")
     _log(f"  labels_offset=+1 first_position_ignored=True shift_mode={shift_mode}")
     _log(f"  attention_backend=mem_efficient+math_sdpa (flash_sdp disabled, cudnn.benchmark=True)")
     if resumed_from:
@@ -622,8 +661,14 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     _install_signal_handlers()
     _signal_save_state.update({"model":model,"tokenizer":bundle.tokenizer,"ckpt_dir":str(ckpt_dir),"step":opt_steps,"optimizer":opt})
     # --- Watchdog thread (10 min timeout) ---
-    _watchdog_cb=lambda: _save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"watchdog_stall_step_{opt_steps:05d}",optimizer=opt)
-    watchdog=_TrainingWatchdog(timeout_sec=600,callback=_watchdog_cb)
+    # On stall: log only — do NOT call _save_checkpoint from watchdog thread
+    # to avoid concurrent disk writes that can freeze Windows further.
+    watchdog=_TrainingWatchdog(timeout_sec=600,callback=None)
+    # --- LLaDA2.0 Sec 7.1: embed noise for mask tokens during WSD warmup ---
+    _embed_noise_warmup_steps=cfg.wsd.warmup_steps if kind=="cpt" else 0
+    if _embed_noise_warmup_steps>0 and opt_steps<_embed_noise_warmup_steps:
+        _install_embed_noise_hook(model,bundle.mask_id,noise_std=0.1)
+        _log(f"  embed_noise_hook=installed warmup_steps={_embed_noise_warmup_steps} std=0.1")
     # --- NaN/Inf progressive recovery config ---
     _nan_skip_limit=5  # max consecutive NaN batches before hard crash
     _nan_skip_streak=0
@@ -662,12 +707,15 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
         }
         write_json(Path(cfg.paths.logs_dir)/f"{kind}.summary.json",_summary)
         return _summary
+    _global_micro=0  # global micro-batch counter across epochs
+    _resumed_opt_steps=opt_steps  # remember starting opt_steps for log gating
     while opt_steps<max_steps:
         epoch+=1
         step_base=(epoch-1)*max(1,len(loader))
         print(f"[_run] EPOCH_START epoch={epoch} loader_len={len(loader)}",flush=True)
         _t_batch_iter_start=time.time()
         for step,batch in enumerate(loader,start=step_base+1):
+            _global_micro+=1
             if step==step_base+1:
                 _t_first_batch=time.time()
                 print(f"[_run] FIRST_BATCH_RECEIVED epoch={epoch} time_to_first_batch={_t_first_batch-_t_batch_iter_start:.2f}s",flush=True)
@@ -681,53 +729,98 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 bidirectional=(phase.phase=="stable")
             else:
                 bidirectional=False
-            # Log phase transitions (once per phase: wsd_phase, bidirectional, verified, mask_mode, attn4d_shape)
+            # Log phase transitions with RUNTIME mask_mode (not static config)
             if phase.phase!=last_phase:
+                _rt_mask_mode="simple_blockdiag" if (kind=="cpt" and phase.phase=="stable") else _mask_mode
+                _rt_seq=_seq if _rt_mask_mode!="composite_llada20" else 2*_seq
+                _rt_attn4d=f"[{_bs},1,{_rt_seq},{_rt_seq}]"
                 _log(
                     f"PHASE_CHANGE wsd_phase={phase.phase}"
                     f" bidirectional={bidirectional}"
                     f" bidirectional_verified={bidir_verified}"
-                    f" mask_mode={_mask_mode}"
-                    f" attn4d_shape={_attn4d_shape}"
+                    f" mask_mode={_rt_mask_mode}"
+                    f" attn4d_shape={_rt_attn4d}"
                     f" block_size={phase.block_size}"
                     f" step={opt_steps}/{max_steps}"
                 )
                 last_phase=phase.phase
+                reset_sdpa_probe()
+                # Grad checkpointing: always ON (8GB VRAM cannot fit without it even at seq=1024)
+                if kind=="cpt" and hasattr(model,"gradient_checkpointing_enable"):
+                    try:
+                        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False,"preserve_rng_state":False})
+                    except TypeError:
+                        model.gradient_checkpointing_enable()
+                    _log(f"  grad_ckpt=ON ({phase.phase} phase)")
+                # Remove embed noise hook when warmup ends
+                if phase.phase!="warmup" and _embed_noise_warmup_steps>0:
+                    _remove_embed_noise_hook()
+                    _log(f"  embed_noise_hook=removed (warmup phase ended)")
             batch={k:v.to(bundle.device,non_blocking=pin_memory) for k,v in batch.items()}
             vocab_cap=max(8,bundle.vocab_size)
             batch["input_ids"]=torch.remainder(batch["input_ids"],vocab_cap)
-            token_seen+=int(batch["attention_mask"].sum().item())
-            if step<=step_base+2:
+            token_seen+=int(batch["attention_mask"].shape[0])*int(batch["attention_mask"].shape[1])
+            if _global_micro<=2:
                 _vram_pre_fwd=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
-                print(f"[_run] PRE_FORWARD step={step} vram_mb={_vram_pre_fwd:.1f} batch_shape={batch['input_ids'].shape}",flush=True)
+                print(f"[_run] PRE_FORWARD opt_step={opt_steps} micro={_global_micro} vram_mb={_vram_pre_fwd:.1f} batch_shape={batch['input_ids'].shape}",flush=True)
             _t_fwd0=time.time()
+            _mtf_turns=max(1,int(cfg.train.multi_turn_t2t))
             try:
-                run_mask_mode=cfg.llada2.mask_mode if kind=="cpt" else cfg.data.doc_mask_mode
-                with torch.amp.autocast("cuda",dtype=torch.float16,enabled=_use_amp):
-                    out=compute_m2t_t2t_losses(
-                        model=model,
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        doc_ids=batch["doc_ids"],
-                        response_mask=batch["response_mask"],
-                        mask_id=bundle.mask_id,
-                        vocab_size=vocab_cap,
-                        cfg=cfg.train,
-                        focus_response=focus_response,
-                        mask_mode=run_mask_mode,
-                        composite_block_size=cfg.llada2.composite_block_size,
-                        trace=tr,
-                        cfg_obj=cfg,
-                        bidirectional=bidirectional,
-                        time_param=time_param,
-                        loss_weighting=loss_weighting,
-                        t_min=ct_t_min,
-                        t_max=ct_t_max
-                    )
+                if kind=="cpt":
+                    run_mask_mode="simple_blockdiag" if phase.phase=="stable" else cfg.llada2.mask_mode
+                else:
+                    run_mask_mode=cfg.data.doc_mask_mode
+                # --- MTF loop (LLaDA 2.1 S3.1): multi-turn forward data augmentation ---
+                _mtf_original_ids=batch["input_ids"]
+                _mtf_current_ids=_mtf_original_ids
+                _mtf_loss_total=0.0
+                _mtf_last_out=None
+                for _mtf_turn in range(_mtf_turns):
+                    _mtf_target=_mtf_original_ids if _mtf_turn>0 else None
+                    with torch.amp.autocast("cuda",dtype=torch.float16,enabled=_use_amp):
+                        out=compute_m2t_t2t_losses(
+                            model=model,
+                            input_ids=_mtf_current_ids,
+                            attention_mask=batch["attention_mask"],
+                            doc_ids=batch["doc_ids"],
+                            response_mask=batch["response_mask"],
+                            mask_id=bundle.mask_id,
+                            vocab_size=vocab_cap,
+                            cfg=cfg.train,
+                            focus_response=focus_response,
+                            mask_mode=run_mask_mode,
+                            composite_block_size=cfg.llada2.composite_block_size,
+                            trace=tr,
+                            cfg_obj=cfg,
+                            bidirectional=bidirectional,
+                            time_param=time_param,
+                            loss_weighting=loss_weighting,
+                            t_min=ct_t_min,
+                            t_max=ct_t_max,
+                            target_ids=_mtf_target
+                        )
+                    _turn_loss=out["loss"]/float(_mtf_turns)
+                    _mtf_loss_total+=float(out["loss"].detach().item())
+                    # backward each turn immediately to keep activation memory flat
+                    (_turn_loss/float(grad_acc)).backward()
+                    # Build next turn's input from model predictions at corrupted positions
+                    if _mtf_turn<_mtf_turns-1:
+                        with torch.no_grad():
+                            _next_ids=_mtf_original_ids.clone()
+                            _corrupted=out["corrupted_positions"]
+                            _next_ids[_corrupted]=out["model_predictions"][_corrupted]
+                            _mtf_current_ids=_next_ids
+                    _mtf_last_out=out
+                    if _mtf_turn<_mtf_turns-1:
+                        del out,_turn_loss
+                # Use last turn's out for logging, synthesize raw_loss as average
+                out=_mtf_last_out
+                raw_loss=torch.tensor(_mtf_loss_total/float(_mtf_turns),device=bundle.device)
+                del _mtf_last_out,_turn_loss
             except RuntimeError as e:
                 _t_fwd1=time.time()
-                if step<=step_base+2:
-                    print(f"[_run] FORWARD_EXCEPTION step={step} elapsed={_t_fwd1-_t_fwd0:.3f}s error={str(e)[:100]}",flush=True)
+                if _global_micro<=2:
+                    print(f"[_run] FORWARD_EXCEPTION opt_step={opt_steps} micro={_global_micro} elapsed={_t_fwd1-_t_fwd0:.3f}s error={str(e)[:100]}",flush=True)
                 if "out of memory" in str(e).lower():
                     oom_happened=True
                     emergency=_save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"emergency_oom_step_{opt_steps:05d}",optimizer=opt)
@@ -744,11 +837,10 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     _write_summary(reason="oom")
                     watchdog.stop()
                 raise
-            raw_loss=out["loss"]
             _t_fwd1=time.time()
-            if step<=step_base+2:
+            if _global_micro<=2:
                 _vram_post_fwd=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
-                print(f"[_run] FORWARD_DONE step={step} elapsed={_t_fwd1-_t_fwd0:.3f}s loss={float(raw_loss.detach().item()):.6f} vram_mb={_vram_post_fwd:.1f}",flush=True)
+                print(f"[_run] FORWARD_DONE opt_step={opt_steps} micro={_global_micro} elapsed={_t_fwd1-_t_fwd0:.3f}s loss={float(raw_loss.item()):.6f} vram_mb={_vram_post_fwd:.1f}",flush=True)
             if not bool(torch.isfinite(raw_loss).item()):
                 nan_inf_count+=1
                 _nan_skip_streak+=1
@@ -769,46 +861,59 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     watchdog.stop()
                     raise RuntimeError(f"loss_nan_inf: {_nan_skip_streak} consecutive bad batches")
                 # Progressive recovery: skip this batch, zero grads, continue
+                del out,raw_loss
                 opt.zero_grad(set_to_none=True)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 continue
-            loss=raw_loss/float(grad_acc)
+            # backward already done inside MTF loop — skip redundant loss.backward()
             _nan_skip_streak=0  # reset streak on valid loss
             # Watchdog heartbeat + signal state update
             watchdog.heartbeat()
             _signal_save_state["step"]=opt_steps
-            if step<=step_base+2:
-                print(f"[_run] BACKWARD_START step={step}",flush=True)
-            _t_bwd0=time.time()
-            loss.backward()
+            _out_loss_val=float(raw_loss.item())
+            _out_t_sampled=float(out.get("t_sampled",cfg.train.mask_ratio))
+            _out_mta=out.get("masked_token_acc")
+            _out_loss_m2t=float(out["loss_m2t"].detach().item())
+            _out_loss_m2t_scaled=float(out.get("loss_m2t_scaled",out["loss_m2t"]).detach().item()) if "loss_m2t_scaled" in out else _out_loss_m2t
+            _out_loss_t2t=float(out["loss_t2t"].detach().item())
+            _out_mask_ratio=float(out.get("mask_ratio_actual",0))
+            _out_pred_count=int(out.get("pred_positions_count",0))
+            del out,raw_loss
             _t_bwd1=time.time()
-            if step<=step_base+2:
+            if _global_micro<=2:
                 _vram_post_bwd=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
-                print(f"[_run] BACKWARD_DONE step={step} elapsed={_t_bwd1-_t_bwd0:.3f}s vram_mb={_vram_post_bwd:.1f}",flush=True)
+                print(f"[_run] FWD_BWD_DONE opt_step={opt_steps} micro={_global_micro} elapsed={_t_bwd1-_t_fwd0:.3f}s vram_mb={_vram_post_bwd:.1f}",flush=True)
             if step%grad_acc==0:
                 grad_norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),grad_clip_val))
                 clip_applied=bool(grad_norm>grad_clip_val)
                 # Gradient explosion detection: if grad_norm is extreme, skip this step
-                if not math.isfinite(grad_norm) or grad_norm>100*grad_clip_val:
-                    _log(f"GRAD_EXPLOSION grad_norm={grad_norm:.2f} threshold={100*grad_clip_val:.2f} — skipping optimizer step")
+                # With 1/t ELBO weighting, high grad_norm (100-2000) is expected — clip handles it.
+                # Only skip for truly catastrophic values (NaN/Inf or > 10000x clip).
+                _grad_explosion_threshold=10000*grad_clip_val
+                if not math.isfinite(grad_norm) or grad_norm>_grad_explosion_threshold:
+                    _log(f"GRAD_EXPLOSION grad_norm={grad_norm:.2f} threshold={_grad_explosion_threshold:.2f} — skipping optimizer step")
                     opt.zero_grad(set_to_none=True)
                     nan_inf_count+=1
                     continue
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 opt_steps+=1
+                # Linearly decay embed noise during warmup
+                if _embed_noise_warmup_steps>0 and opt_steps<_embed_noise_warmup_steps:
+                    _noise_frac=1.0-float(opt_steps)/float(_embed_noise_warmup_steps)
+                    set_embed_noise_std(0.1*max(0.0,_noise_frac))
                 # LR schedule: linear warmup + cosine decay
                 current_lr=_compute_lr(opt_steps,lr_warmup,max_steps,lr_base,lr_min_ratio)
                 for pg in opt.param_groups:
                     pg["lr"]=current_lr
-                last_loss=float(raw_loss.detach().item())
+                last_loss=_out_loss_val
                 # T-bucket aggregation
-                t_val=float(out.get("t_sampled",cfg.train.mask_ratio))
+                t_val=_out_t_sampled
                 bk=_t_bucket_key(t_val)
                 t_bucket_loss[bk]["sum"]+=last_loss
                 t_bucket_loss[bk]["count"]+=1
-                mta_v=out.get("masked_token_acc")
+                mta_v=_out_mta
                 if mta_v is not None:
                     t_bucket_acc[bk]["sum"]+=mta_v
                     t_bucket_acc[bk]["count"]+=1
@@ -851,8 +956,8 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 tb_loss={k:(t_bucket_loss[k]["sum"]/max(1,t_bucket_loss[k]["count"])) for k in _T_BUCKET_NAMES}
                 tb_acc={k:(t_bucket_acc[k]["sum"]/max(1,t_bucket_acc[k]["count"])) for k in _T_BUCKET_NAMES}
                 t_mean=t_agg["sum"]/max(1,t_agg["count"])
-                loss_m2t_raw=float(out["loss_m2t"].item())
-                loss_m2t_scaled=float(out.get("loss_m2t_scaled",out["loss_m2t"]).item()) if "loss_m2t_scaled" in out else loss_m2t_raw
+                loss_m2t_raw=_out_loss_m2t
+                loss_m2t_scaled=_out_loss_m2t_scaled
                 row={
                     "kind":kind,
                     "epoch":epoch,
@@ -863,8 +968,8 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     "loss_masked":loss_m2t_raw,
                     "loss_scaled":loss_m2t_scaled,
                     "loss_m2t":loss_m2t_raw,
-                    "loss_t2t":float(out["loss_t2t"].item()),
-                    "masked_token_acc":out.get("masked_token_acc"),
+                    "loss_t2t":_out_loss_t2t,
+                    "masked_token_acc":_out_mta,
                     "json_valid_rate":None,
                     "lr":current_lr,
                     "wd":float(cfg.train.weight_decay),
@@ -879,7 +984,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     "vram_alloc_mb":round(vram_alloc_mb,1),
                     "vram_reserved_mb":round(vram_reserved_mb,1),
                     "vram_peak_mb":round(vram_peak_mb,1),
-                    "nan_inf_detected":not bool(torch.isfinite(raw_loss).item()) if raw_loss is not None else False,
+                    "nan_inf_detected":not math.isfinite(_out_loss_val),
                     "nan_inf_count":nan_inf_count,
                     "stage":"wsd" if kind=="cpt" else kind,
                     "step_current":int(opt_steps),
@@ -889,15 +994,15 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     "eta_stage_sec":eta,
                     "peak_vram_bytes":peak_vram,
                     # Diffusion-specific (continuous-time)
-                    "t_sampled":float(out.get("t_sampled",0)),
+                    "t_sampled":_out_t_sampled,
                     "t_mean":t_mean,
                     "t_min":t_agg["min"],
                     "t_max":t_agg["max"],
                     "p_mask_expected":t_mean,
-                    "mask_ratio_actual":float(out.get("mask_ratio_actual",0)),
+                    "mask_ratio_actual":_out_mask_ratio,
                     "loss_by_t_bucket":tb_loss,
                     "acc_masked_by_t_bucket":tb_acc,
-                    "pred_positions_count":int(out.get("pred_positions_count",0)),
+                    "pred_positions_count":_out_pred_count,
                     # WSD schedule
                     "wsd_phase":phase.phase,
                     "wsd_block_size":phase.block_size,
@@ -914,24 +1019,26 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     "loss_weighting":loss_weighting,
                 }
                 append_jsonl(log_path,[row])
-                if opt_steps==1 or opt_steps%log_every==0 or opt_steps==max_steps:
+                _is_first_step=(opt_steps==_resumed_opt_steps+1)
+                if _is_first_step or opt_steps%log_every==0 or opt_steps==max_steps:
                     mta=row['masked_token_acc']
                     mta_s=f"{mta:.4f}" if mta is not None else "n/a"
                     _log(f"stage={row['stage']} step={row['step_current']}/{row['steps_total']} phase={row['phase']} block={row['block_size']} bidir={bidirectional} loss={row['loss']:.6f} loss_m={loss_m2t_raw:.4f} loss_s={loss_m2t_scaled:.4f} mta={mta_s} t={row['t_sampled']:.3f} mask%={row['mask_ratio_actual']:.3f} lr={current_lr:.2e} gn={grad_norm:.2f} clip={clip_applied} tok={row['tokens_seen_total']} sec={row['sec_per_step_avg']:.3f} eta={row['eta_stage_sec']:.0f}s vram={row['vram_peak_mb']:.0f}MB")
                     # Left-shift spot check every 500 steps
                     if opt_steps==1 or opt_steps%500==0:
-                        _log(f"  SHIFT_CHECK shift_mode={shift_mode} labels_offset=+1 first_position_ignored=True pred_positions_count={out.get('pred_positions_count',0)} masked_pred_positions_count={out.get('pred_positions_count',0)}")
+                        _log(f"  SHIFT_CHECK shift_mode={shift_mode} labels_offset=+1 first_position_ignored=True pred_positions_count={_out_pred_count} masked_pred_positions_count={_out_pred_count}")
                     # T-bucket report every log_every
                     tb_line=" ".join(f"{k}:L={tb_loss[k]:.3f}/A={tb_acc[k]:.3f}" for k in _T_BUCKET_NAMES)
                     _log(f"  T_BUCKETS t_mean={t_mean:.3f} t_min={t_agg['min']:.3f} t_max={t_agg['max']:.3f} {tb_line}")
-                if tr is not None:
+                if tr is not None and (_is_first_step or opt_steps%log_every==0 or opt_steps==max_steps):
                     tr.record_metric(name=f"{kind}.loss_total",value=last_loss,step=opt_steps,module="training",func="_run")
-                    tr.record_metric(name=f"{kind}.loss_m2t",value=float(out["loss_m2t"].item()),step=opt_steps,module="training",func="_run")
-                    tr.record_metric(name=f"{kind}.loss_t2t",value=float(out["loss_t2t"].item()),step=opt_steps,module="training",func="_run")
-                if opt_steps==1 or opt_steps==max_steps or opt_steps%ckpt_every==0:
-                    _save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"step_{opt_steps:05d}",optimizer=opt)
+                    tr.record_metric(name=f"{kind}.loss_m2t",value=_out_loss_m2t,step=opt_steps,module="training",func="_run")
+                    tr.record_metric(name=f"{kind}.loss_t2t",value=_out_loss_t2t,step=opt_steps,module="training",func="_run")
+                if opt_steps==max_steps or opt_steps%ckpt_every==0:
+                    _save_checkpoint(model,bundle.tokenizer,Path(ckpt_dir),f"step_{opt_steps:05d}",optimizer=opt,watchdog=watchdog)
                     _prune_checkpoints(Path(ckpt_dir),keep_last)
                     if torch.cuda.is_available():
+                        gc.collect()
                         torch.cuda.empty_cache()
                 if opt_steps%eval_every==0 or opt_steps==max_steps:
                     ev=_periodic_eval(model,bundle.tokenizer,bundle.device,bundle.mask_id,cfg,seed=cfg.runtime.seed+opt_steps)
@@ -942,7 +1049,12 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     ev["step"]=opt_steps
                     append_jsonl(eval_path,[ev])
                     if torch.cuda.is_available():
+                        gc.collect()
                         torch.cuda.empty_cache()
+                # Periodic VRAM defrag: combat allocator fragmentation on tight-VRAM GPUs
+                if opt_steps%50==0 and torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 if cooldown_every>0 and cooldown_seconds>0 and opt_steps<max_steps and opt_steps%cooldown_every==0:
                     _log(f"stage={row['stage']} cooldown_start step={opt_steps} sleep_sec={cooldown_seconds}")
                     if tr is not None:
@@ -977,6 +1089,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
         if len(loader)==0:
             break
     watchdog.stop()
+    _signal_save_state.update({"model":None,"tokenizer":None,"optimizer":None,"ckpt_dir":None})
     summary=_write_summary(reason="normal")
     return summary
 

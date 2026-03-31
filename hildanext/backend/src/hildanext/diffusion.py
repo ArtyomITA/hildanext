@@ -140,8 +140,9 @@ def _pick_positions(base_mask:torch.Tensor,p:float)->torch.Tensor:
     return m
 
 def _causal_loss(logits:torch.Tensor,labels:torch.Tensor,num_chunks:int=8)->torch.Tensor:
-    """Cross-entropy with left-shift, computed in chunks to avoid materializing full (B,S,V) logits.
-    Saves ~500MB VRAM for V=151936 (Qwen3). Inspired by torchtune CEWithChunkedOutputLoss."""
+    """Cross-entropy with left-shift. When few positions are valid (masked diffusion),
+    gathers only those positions' logits to avoid materializing a full (B,S,V) view.
+    For V=151936 and ~15% mask ratio: 297MB → ~44MB logits in backward."""
     if logits.shape[1]<2:
         return torch.tensor(0.0,device=logits.device)
     y=labels[:,1:].contiguous()
@@ -149,17 +150,26 @@ def _causal_loss(logits:torch.Tensor,labels:torch.Tensor,num_chunks:int=8)->torc
         return logits.sum()*0.0
     S=logits.shape[1]-1
     V=logits.shape[-1]
-    # For small vocab or short sequences, regular CE is faster
+    valid_mask=y.ne(-100)
+    n_valid=int(valid_mask.sum().item())
+    # Gather path: when <50% positions are valid, gather is much cheaper
+    if n_valid>0 and n_valid<S*y.shape[0]*0.5:
+        flat_logits=logits[:,:-1,:].reshape(-1,V)
+        flat_labels=y.reshape(-1)
+        flat_valid=valid_mask.reshape(-1)
+        idx=flat_valid.nonzero(as_tuple=True)[0]
+        gathered_logits=flat_logits[idx]
+        gathered_labels=flat_labels[idx]
+        return F.cross_entropy(gathered_logits,gathered_labels,reduction="mean")
+    # Chunked fallback for dense labels
     if S*V<500_000 or num_chunks<=1:
         l=logits[:,:-1,:].contiguous()
         return F.cross_entropy(l.view(-1,V),y.view(-1),ignore_index=-100)
-    # Chunked: split sequence dim into chunks, compute CE per chunk
     chunk_size=max(1,(S+num_chunks-1)//num_chunks)
     total_loss=torch.tensor(0.0,device=logits.device,dtype=torch.float32)
     total_count=0
     for i in range(0,S,chunk_size):
         end=min(i+chunk_size,S)
-        # Slice logits on-the-fly — only one chunk in memory at a time
         l_chunk=logits[:,i:end,:].contiguous()
         y_chunk=y[:,i:end].contiguous()
         valid=y_chunk.ne(-100).sum().item()
@@ -186,6 +196,51 @@ def _attn_for_model(mask:torch.Tensor,model)->torch.Tensor:
     return out
 
 _sdpa_backend_logged=False
+def reset_sdpa_probe():
+    global _sdpa_backend_logged
+    _sdpa_backend_logged=False
+_embed_noise_hook=None
+_embed_noise_mask_id=None
+_embed_noise_std=0.0
+
+def _install_embed_noise_hook(model,mask_id:int,noise_std:float=0.1):
+    """LLaDA2.0 Sec 7.1: add Gaussian noise to embedding output for masked tokens.
+    Prevents gradient explosion from near-zero mask embeddings during WSD warmup."""
+    global _embed_noise_hook,_embed_noise_mask_id,_embed_noise_std
+    _embed_noise_mask_id=mask_id
+    _embed_noise_std=noise_std
+    embed_layer=None
+    for name,mod in model.named_modules():
+        if name.endswith("embed_tokens") or (hasattr(mod,"weight") and isinstance(mod,torch.nn.Embedding) and mod.weight.shape[0]>1000):
+            embed_layer=mod
+            break
+    if embed_layer is None:
+        return
+    def _hook(module,input,output):
+        if _embed_noise_std<=0 or _embed_noise_mask_id is None:
+            return output
+        if len(input)>0 and isinstance(input[0],torch.Tensor):
+            ids=input[0]
+            mask_pos=(ids==_embed_noise_mask_id)
+            if mask_pos.any():
+                noise=torch.randn_like(output)*_embed_noise_std
+                noise[~mask_pos]=0.0
+                return output+noise
+        return output
+    _embed_noise_hook=embed_layer.register_forward_hook(_hook)
+    print(f"[EMBED_NOISE] installed hook on embedding, mask_id={mask_id}, std={noise_std}",flush=True)
+
+def _remove_embed_noise_hook():
+    global _embed_noise_hook,_embed_noise_std
+    if _embed_noise_hook is not None:
+        _embed_noise_hook.remove()
+        _embed_noise_hook=None
+    _embed_noise_std=0.0
+
+def set_embed_noise_std(std:float):
+    global _embed_noise_std
+    _embed_noise_std=std
+
 def _forward(model,input_ids:torch.Tensor,attn_1d:torch.Tensor,doc_ids:torch.Tensor,mask_mode:str,clean_ids:Optional[torch.Tensor]=None,composite_block_size:int|None=None,trace=None,cfg=None,bidirectional:bool=False):
     global _sdpa_backend_logged
     tr=use_trace(cfg,trace)
@@ -216,7 +271,8 @@ def _forward(model,input_ids:torch.Tensor,attn_1d:torch.Tensor,doc_ids:torch.Ten
                     out=model(input_ids=ids2,attention_mask=attn4d)
             else:
                 out=model(input_ids=ids2,attention_mask=attn4d)
-            logits=out.logits[:,:l,:]
+            logits=out.logits[:,:l,:].contiguous()
+            del out
             return SimpleNamespace(logits=logits)
         doc_mask=batch_doc_attention_mask(doc_ids,causal=not bidirectional,mask_mode=mask_mode)
         attn4d=_attn_for_model(doc_mask,model)
@@ -289,51 +345,76 @@ def _make_t2t_batch(input_ids:torch.Tensor,attn_mask:torch.Tensor,response_mask:
     x,y,_=t2t_corrupt_tokens(input_ids,attn_mask,response_mask,ratio,vocab_size)
     return x,y
 
-def compute_m2t_t2t_losses(model,input_ids:torch.Tensor,attention_mask:torch.Tensor,doc_ids:torch.Tensor,response_mask:torch.Tensor|None,mask_id:int,vocab_size:int,cfg:TrainConfig,focus_response:bool,mask_mode:str="simple_blockdiag",composite_block_size:int|None=None,trace=None,cfg_obj=None,bidirectional:bool=False,time_param:str="discrete",loss_weighting:str="none",t_min:float=0.001,t_max:float=1.0)->Dict[str,torch.Tensor]:
-    """Compute M2T + T2T losses.
-    S0-A: bidirectional controls causal vs non-causal attention.
-    S0-C: time_param='continuous_time' → t~U(t_min,t_max), mask i.i.d. p=t;
-           loss_weighting='inv_t' → CE scaled by 1/t (ELBO).
-    S0-D: left-shift is preserved in _causal_loss (logits[:,:-1] vs labels[:,1:]);
-           position 0 is never predictable."""
+def compute_m2t_t2t_losses(model,input_ids:torch.Tensor,attention_mask:torch.Tensor,doc_ids:torch.Tensor,response_mask:torch.Tensor|None,mask_id:int,vocab_size:int,cfg:TrainConfig,focus_response:bool,mask_mode:str="simple_blockdiag",composite_block_size:int|None=None,trace=None,cfg_obj=None,bidirectional:bool=False,time_param:str="discrete",loss_weighting:str="none",t_min:float=0.001,t_max:float=1.0,target_ids:Optional[torch.Tensor]=None)->Dict[str,torch.Tensor]:
+    """Merged M2T+T2T: single forward pass with mixed corruption (LLaDA 2.1 recipe).
+    M2T positions: masked with [MASK], T2T positions: replaced with random tokens.
+    Disjoint sets → single forward, separate loss streams.
+    If target_ids is provided (MTF turn>1), input_ids is the base to corrupt
+    (may contain model predictions), target_ids holds the ground-truth labels."""
+    _target=target_ids if target_ids is not None else input_ids
     focus=response_mask if focus_response else None
     t_sampled=float(cfg.mask_ratio)
     mask_ratio_actual=0.0
+    cand=attention_mask.bool()
+    if focus is not None:
+        cand=cand & focus.bool()
     if time_param=="continuous_time":
-        m2t_x,m2t_y,t_sampled,mask_ratio_actual=_continuous_time_m2t_batch(input_ids,attention_mask,focus,mask_id,t_min,t_max)
+        t=float(torch.empty(1).uniform_(t_min,t_max).item())
+        rand_m=torch.rand_like(input_ids.float())
+        m2t_pos=(rand_m<t) & cand
+        if not m2t_pos.any():
+            idx=torch.nonzero(cand,as_tuple=False)
+            if idx.numel()>0:
+                m2t_pos[idx[0,0],idx[0,1]]=True
+        t_sampled=t
+        n_cand=max(1,int(cand.sum().item()))
+        mask_ratio_actual=float(m2t_pos.sum().item())/n_cand
     else:
-        m2t_x,m2t_y=_make_m2t_batch(input_ids,attention_mask,focus,mask_id,cfg.mask_ratio)
+        rand_m=torch.rand_like(input_ids.float())
+        m2t_pos=(rand_m<float(cfg.mask_ratio)) & cand
+        if not m2t_pos.any():
+            idx=torch.nonzero(cand,as_tuple=False)
+            if idx.numel()>0:
+                m2t_pos[idx[0,0],idx[0,1]]=True
         t_sampled=float(cfg.mask_ratio)
-        mask_pos_disc=m2t_y.ne(-100)
-        cand_disc=attention_mask.bool()
-        if focus is not None:
-            cand_disc=cand_disc & focus.bool()
-        mask_ratio_actual=float(mask_pos_disc.sum().item())/max(1,float(cand_disc.sum().item()))
-    out_m2t=_forward(model,m2t_x,attention_mask,doc_ids,mask_mode=mask_mode,clean_ids=input_ids,composite_block_size=composite_block_size,trace=trace,cfg=cfg_obj,bidirectional=bidirectional)
-    loss_m2t_raw=_causal_loss(out_m2t.logits,m2t_y)
-    # S0-C ELBO weighting: scale by 1/t
+        n_cand=max(1,int(cand.sum().item()))
+        mask_ratio_actual=float(m2t_pos.sum().item())/n_cand
+    remaining=cand & ~m2t_pos
+    rand_t=torch.rand_like(input_ids.float())
+    t2t_pos=(rand_t<float(cfg.t2t_noise_ratio)) & remaining
+    mixed=input_ids.clone()
+    mixed[m2t_pos]=mask_id
+    if t2t_pos.any():
+        rnd=torch.randint(low=0,high=max(8,vocab_size),size=input_ids.shape,device=input_ids.device)
+        same=t2t_pos & rnd.eq(input_ids)
+        if same.any():
+            rnd[same]=(rnd[same]+1)%max(8,vocab_size)
+        mixed[t2t_pos]=rnd[t2t_pos]
+    m2t_labels=torch.full_like(input_ids,-100)
+    m2t_labels[m2t_pos]=_target[m2t_pos]
+    t2t_labels=torch.full_like(input_ids,-100)
+    t2t_labels[t2t_pos]=_target[t2t_pos]
+    out=_forward(model,mixed,attention_mask,doc_ids,mask_mode=mask_mode,clean_ids=_target,composite_block_size=composite_block_size,trace=trace,cfg=cfg_obj,bidirectional=bidirectional)
+    loss_m2t_raw=_causal_loss(out.logits,m2t_labels)
     if loss_weighting=="inv_t":
         t_clamp=max(float(t_sampled),0.001)
         loss_m2t=loss_m2t_raw/t_clamp
     else:
         loss_m2t=loss_m2t_raw
-    t2t_losses=[]
-    turns=max(1,int(cfg.multi_turn_t2t))
-    for _ in range(turns):
-        t2t_x,t2t_y=_make_t2t_batch(input_ids,attention_mask,focus,cfg.t2t_noise_ratio,vocab_size)
-        out_t2t=_forward(model,t2t_x,attention_mask,doc_ids,mask_mode=mask_mode,clean_ids=input_ids,composite_block_size=composite_block_size,trace=trace,cfg=cfg_obj,bidirectional=bidirectional)
-        t2t_losses.append(_causal_loss(out_t2t.logits,t2t_y))
-    loss_t2t=torch.stack(t2t_losses).mean()
+    loss_t2t=_causal_loss(out.logits,t2t_labels)
     loss=cfg.m2t_weight*loss_m2t+cfg.t2t_weight*loss_t2t
     with torch.no_grad():
-        # S0-D: left-shift-correct accuracy — logits[i] predicts token i+1
-        preds=out_m2t.logits.argmax(-1)
-        shifted_preds=preds[:,:-1]      # predictions for positions 1..S-1
-        shifted_labels=m2t_y[:,1:]       # targets at positions 1..S-1
+        preds=out.logits.argmax(-1)
+        shifted_preds=preds[:,:-1]
+        shifted_labels=m2t_labels[:,1:]
         shifted_mask=shifted_labels.ne(-100)
         masked_token_acc=float((shifted_preds[shifted_mask]==shifted_labels[shifted_mask]).float().mean().item()) if shifted_mask.any() else None
         pred_positions_count=int(shifted_mask.sum().item())
-    return {"loss":loss,"loss_m2t":loss_m2t_raw.detach(),"loss_m2t_scaled":loss_m2t.detach(),"loss_t2t":loss_t2t.detach(),"masked_token_acc":masked_token_acc,"t_sampled":t_sampled,"mask_ratio_actual":mask_ratio_actual,"pred_positions_count":pred_positions_count}
+        # MTF: build full-position predictions (left-shift: logit[i] predicts pos i+1)
+        _mtf_preds=_target.clone()
+        _mtf_preds[:,1:]=preds[:,:-1]
+        _corrupted=m2t_pos|t2t_pos
+    return {"loss":loss,"loss_m2t":loss_m2t_raw.detach(),"loss_m2t_scaled":loss_m2t.detach(),"loss_t2t":loss_t2t.detach(),"masked_token_acc":masked_token_acc,"t_sampled":t_sampled,"mask_ratio_actual":mask_ratio_actual,"pred_positions_count":pred_positions_count,"model_predictions":_mtf_preds,"corrupted_positions":_corrupted}
 
 def apply_remask(tokens:torch.Tensor,confidence:torch.Tensor,mask_id:int,cfg:RemaskConfig)->torch.Tensor:
     x=tokens.clone()

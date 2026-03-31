@@ -1,0 +1,475 @@
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.globalPanel {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(7, 18, 30, 0.78);
+  padding: 0.9rem;
+  margin-bottom: 1rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.globalHead h3 {
+  margin: 0;
+  font-size: 0.96rem;
+}
+
+.globalHead p {
+  margin: 0.3rem 0 0;
+  color: var(--text-soft);
+  font-size: 0.8rem;
+}
+
+.globalGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.globalActions {
+  display: flex;
+  gap: 0.65rem;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.secondaryBtn {
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(12, 27, 41, 0.8);
+  color: var(--text-soft);
+  padding: 0.44rem 0.72rem;
+  cursor: pointer;
+}
+
+.secondaryBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.scoreboardPanel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(5, 13, 22, 0.82);
+  padding: 0.8rem;
+  margin-bottom: 1rem;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.scoreboardHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.scoreboardHead h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.scoreboardFilterPanel {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(9, 22, 34, 0.7);
+  padding: 0.5rem;
+}
+
+.scoreboardTableWrap {
+  overflow: auto;
+}
+
+.scoreboardTable {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+}
+
+.scoreboardTable th,
+.scoreboardTable td {
+  border: 1px solid var(--line);
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  font-size: 0.78rem;
+  color: var(--text-soft);
+}
+
+.scoreboardTable th {
+  background: rgba(15, 33, 51, 0.74);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.7rem;
+}
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(8, 17, 28, 0.72);
+  padding: 0.95rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.cardHead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.cardHead h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.cardActions {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.cardHead button:not(.secondaryBtn) {
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(35, 101, 128, 0.8), rgba(20, 66, 86, 0.88));
+  color: var(--text);
+  padding: 0.5rem 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cardHead button:not(.secondaryBtn):disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.copy {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.86rem;
+}
+
+.inlineField {
+  display: grid;
+  gap: 0.33rem;
+}
+
+.inlineField span {
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.inlineField select,
+.inlineField input {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(6, 13, 20, 0.82);
+  color: var(--text);
+  padding: 0.46rem 0.58rem;
+  font-size: 0.82rem;
+}
+
+.inlineField strong {
+  font-size: 0.78rem;
+  color: var(--text-soft);
+}
+
+.settingsBox {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(6, 14, 23, 0.6);
+  padding: 0.45rem 0.5rem;
+}
+
+.settingsBox summary {
+  cursor: pointer;
+  color: var(--text-soft);
+  font-size: 0.78rem;
+  user-select: none;
+}
+
+.settingsGrid {
+  margin-top: 0.45rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.checkboxField {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(8, 19, 31, 0.68);
+  padding: 0.45rem 0.58rem;
+  font-size: 0.82rem;
+  color: var(--text-soft);
+}
+
+.checkboxField input {
+  margin: 0;
+}
+
+.meta {
+  margin: -0.35rem 0 0;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  word-break: break-word;
+}
+
+.progressWrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.progressWrap progress {
+  width: 100%;
+  height: 10px;
+}
+
+.progressWrap span {
+  color: var(--text-soft);
+  font-size: 0.8rem;
+}
+
+.gauge {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.track {
+  position: relative;
+  height: 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  background: rgba(11, 29, 43, 0.82);
+}
+
+.fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, rgba(67, 190, 255, 0.82), rgba(48, 119, 229, 0.9));
+}
+
+.baseline {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  border-radius: 999px;
+  background: rgba(255, 188, 95, 0.95);
+  box-shadow: 0 0 10px rgba(255, 188, 95, 0.5);
+}
+
+.legend {
+  display: flex;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.legend span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.32rem 0.55rem;
+  background: rgba(9, 23, 35, 0.8);
+  color: var(--text-soft);
+  font-size: 0.78rem;
+}
+
+.promptField {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.promptField span {
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.promptField input {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(6, 13, 20, 0.82);
+  color: var(--text);
+  padding: 0.55rem 0.7rem;
+}
+
+.chartWrap {
+  min-height: 260px;
+}
+
+.empty {
+  margin: 0;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  padding: 0.85rem;
+  color: var(--text-dim);
+}
+
+.output {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(8, 21, 32, 0.78);
+  padding: 0.6rem;
+}
+
+.output strong {
+  display: block;
+  margin-bottom: 0.3rem;
+  font-size: 0.8rem;
+  color: var(--text-soft);
+}
+
+.output p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.error {
+  margin: 0;
+  border: 1px solid rgba(255, 115, 115, 0.35);
+  border-radius: 12px;
+  padding: 0.45rem 0.55rem;
+  color: #ffadad;
+  background: rgba(89, 20, 27, 0.34);
+  font-size: 0.82rem;
+}
+
+.logBox {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(5, 11, 18, 0.8);
+}
+
+.logHead {
+  margin: 0;
+  padding: 0.45rem 0.55rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-dim);
+  font-size: 0.73rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.logBody {
+  max-height: 160px;
+  overflow: auto;
+  display: grid;
+  gap: 0.1rem;
+  padding: 0.35rem 0.45rem;
+}
+
+.logItem {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.logEmpty {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.logRow {
+  margin: 0;
+  padding: 0.2rem 0.25rem;
+  border-radius: 6px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.45rem;
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.logRow span:first-child {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.logRow[data-level="info"] {
+  color: var(--text-soft);
+}
+
+.logRow[data-level="ok"] {
+  color: #bfffd7;
+  background: rgba(57, 173, 68, 0.12);
+}
+
+.logRow[data-level="warn"] {
+  color: #ffe3bb;
+  background: rgba(255, 182, 72, 0.12);
+}
+
+.logRow[data-level="error"] {
+  color: #ffb3b3;
+  background: rgba(255, 102, 123, 0.14);
+}
+
+.logDetails {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 0.2rem 0.35rem;
+}
+
+.logDetails summary {
+  cursor: pointer;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.logDetails pre {
+  margin: 0.3rem 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.74rem;
+  color: var(--text-soft);
+}
+
+.disabledCard {
+  opacity: 0.7;
+  filter: grayscale(0.2);
+}
+
+@media (max-width: 1050px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .globalGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settingsGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .scoreboardTable {
+    min-width: 640px;
+  }
+}
+
+@media (max-width: 640px) {
+  .globalGrid {
+    grid-template-columns: 1fr;
+  }
+}

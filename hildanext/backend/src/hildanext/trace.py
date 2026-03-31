@@ -58,6 +58,7 @@ class RunTrace:
         self.config_digest=str(config_digest or "")
         self._fallback_rows:List[Dict[str,Any]]=[]
         self._metric_rows:List[Dict[str,Any]]=[]
+        self._max_inmem_rows=500
         self.fallback_path=self.root/"fallbacks.jsonl"
         self.metric_path=self.root/"metrics.jsonl"
     def _base(self,module:str,func:str,event_type:str,action:str,reason:str,timestamp_utc:Optional[str],exception_str:Optional[str],extra_dict:Optional[Dict[str,Any]])->Dict[str,Any]:
@@ -116,6 +117,8 @@ class RunTrace:
         exc=exception_str or ""
         row=self._base(module=module,func=func,event_type=str(event or "fallback"),action=action,reason=reason,timestamp_utc=timestamp_utc,exception_str=exc,extra_dict=extra_dict)
         self._fallback_rows.append(row)
+        if len(self._fallback_rows)>self._max_inmem_rows:
+            self._fallback_rows=self._fallback_rows[-self._max_inmem_rows:]
         self._append_jsonl(self.fallback_path,row)
         self._emit_console(row)
         if self.strict_fallbacks and not self._is_whitelisted(row):
@@ -124,12 +127,16 @@ class RunTrace:
     def record_env_issue(self,name:str,detail:str,module:str="env",func:str="record_env_issue",extra_dict:Optional[Dict[str,Any]]=None,timestamp_utc:Optional[str]=None)->Dict[str,Any]:
         row=self._base(module=module,func=func,event_type="env_issue",action=str(name),reason=str(detail),timestamp_utc=timestamp_utc,exception_str="",extra_dict=extra_dict)
         self._fallback_rows.append(row)
+        if len(self._fallback_rows)>self._max_inmem_rows:
+            self._fallback_rows=self._fallback_rows[-self._max_inmem_rows:]
         self._append_jsonl(self.fallback_path,row)
         self._emit_console(row)
         return row
     def record_notice(self,module:str,func:str,action:str,reason:str,extra_dict:Optional[Dict[str,Any]]=None,timestamp_utc:Optional[str]=None)->Dict[str,Any]:
         row=self._base(module=module,func=func,event_type="notice",action=action,reason=reason,timestamp_utc=timestamp_utc,exception_str="",extra_dict=extra_dict)
         self._fallback_rows.append(row)
+        if len(self._fallback_rows)>self._max_inmem_rows:
+            self._fallback_rows=self._fallback_rows[-self._max_inmem_rows:]
         self._append_jsonl(self.fallback_path,row)
         self._emit_console(row)
         return row
@@ -147,6 +154,8 @@ class RunTrace:
             "extra":_jsonable(extra_dict or {})
         }
         self._metric_rows.append(row)
+        if len(self._metric_rows)>self._max_inmem_rows:
+            self._metric_rows=self._metric_rows[-self._max_inmem_rows:]
         self._append_jsonl(self.metric_path,row)
         self._emit_console(row)
         return row

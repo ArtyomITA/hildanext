@@ -1,0 +1,66 @@
+{
+  "isfinite_item": {
+    "n": 30,
+    "mean_us": 1479.8,
+    "median_us": 152.8,
+    "p95_us": 281.0,
+    "min_us": 138.7,
+    "max_us": 39513.3
+  },
+  "item_6_direct": {
+    "n": 30,
+    "mean_us": 167.7,
+    "median_us": 164.4,
+    "p95_us": 184.1,
+    "min_us": 143.5,
+    "max_us": 280.8
+  },
+  "item_6_deferred_cpu": {
+    "n": 30,
+    "mean_us": 277.8,
+    "median_us": 253.7,
+    "p95_us": 394.8,
+    "min_us": 243.7,
+    "max_us": 463.7
+  },
+  "nvidia_smi": {
+    "n": 20,
+    "mean_us": 48052.4,
+    "median_us": 46896.3,
+    "p95_us": 55219.6,
+    "min_us": 45128.3,
+    "max_us": 55219.6
+  },
+  "pynvml": {
+    "n": 20,
+    "mean_us": 734.6,
+    "median_us": 5.9,
+    "p95_us": 14566.4,
+    "min_us": 5.8,
+    "max_us": 14566.4
+  },
+  "empty_cache": {
+    "n": 30,
+    "mean_us": 1086.5,
+    "median_us": 1091.4,
+    "p95_us": 1270.0,
+    "min_us": 236.1,
+    "max_us": 1298.2
+  },
+  "wsd_block": {
+    "n": 30,
+    "mean_us": 10.6,
+    "median_us": 9.1,
+    "p95_us": 16.8,
+    "min_us": 8.5,
+    "max_us": 41.7
+  },
+  "remainder": {
+    "n": 30,
+    "mean_us": 791.6,
+    "median_us": 38.3,
+    "p95_us": 94.4,
+    "min_us": 37.0,
+    "max_us": 22462.8
+  }
+}

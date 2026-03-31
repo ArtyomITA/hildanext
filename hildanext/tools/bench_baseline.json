@@ -1,0 +1,11 @@
+{
+  "label": "baseline",
+  "micro_batches": 20,
+  "wall_time_s": 219.99,
+  "avg_fwd_s": 1.692,
+  "avg_bwd_s": 9.2,
+  "avg_micro_batch_s": 10.893,
+  "tokens_per_sec": 93.1,
+  "peak_vram_mb": 4402.0,
+  "total_tokens": 20480
+}

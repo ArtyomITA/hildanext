@@ -171,3 +171,80 @@ export interface LogSummary {
   byAction: Record<string, number>;
   byReason: Record<string, number>;
 }
+
+export type ChatEngineMode = "AR" | "DLLM" | "BOTH";
+export type ChatLane = "ar" | "dllm";
+export type ThinkingMode = "auto" | "on" | "off";
+export type ArDecodeMode = "greedy" | "sampling";
+
+export interface ModelCatalogEntry {
+  id: string;
+  lane: ChatLane;
+  label: string;
+  description: string;
+}
+
+export interface ChatRunConfig {
+  engineMode: ChatEngineMode;
+  arModelId: string;
+  dllmModelId: string;
+  decodeMode: "S_MODE" | "Q_MODE";
+  effort: "instant" | "low" | "medium" | "high" | "adaptive";
+  maxNewTokens: number;
+  seed: number;
+  temperature: number;
+  topP: number;
+  topK: number;
+  presencePenalty: number;
+  repetitionPenalty: number;
+  tauMask: number;
+  tauEdit: number;
+  systemPrompt: string;
+  thinkingMode: ThinkingMode;
+  contextWindowTokens: number;
+  arDecodeMode: ArDecodeMode;
+}
+
+export interface SavedPreset {
+  id: string;
+  name: string;
+  config: ChatRunConfig;
+}
+
+export interface LaneResult {
+  lane: ChatLane;
+  modelId: string;
+  status: "success" | "error" | "offline";
+  text: string;
+  message: string;
+  engine: string;
+  tokensPerSec: number | null;
+  stepsToConverge: number | null;
+  vramPeakBytes: number | null;
+  dtype?: string;
+  dummyModel: boolean;
+  finishReason?: string;
+  truncated?: boolean;
+  device?: string;
+  ignoredSamplingParams?: boolean;
+  cpuFallback?: boolean;
+  rawText?: string;
+  rawStats?: Record<string, unknown>;
+}
+
+export interface ChatTurn {
+  id: string;
+  createdAt: string;
+  prompt: string;
+  config: ChatRunConfig;
+  status: "running" | "completed";
+  lanes: LaneResult[];
+}
+
+export interface ChatThread {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  turns: ChatTurn[];
+}
