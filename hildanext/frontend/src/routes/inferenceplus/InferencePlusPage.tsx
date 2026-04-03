@@ -703,10 +703,14 @@ export function InferencePlusPage() {
                         {t.mode === "EntRGi" && (
                           <>
                             <span className={styles.diagBadge}>reward: {fmt(t.diagnostics.reward_model_loaded)}</span>
+                            <span className={styles.diagBadge}>tok_align: {fmt(t.diagnostics.reward_tokenizer_aligned)}</span>
+                            <span className={styles.diagBadge}>align_mode: {fmt(t.diagnostics.tokenizer_alignment_mode)}</span>
                             <span className={styles.diagBadge}>η: {fmt(t.diagnostics.guidance_scale)}</span>
                             <span className={styles.diagBadge}>M: {fmt(t.diagnostics.guidance_steps)}</span>
                             <span className={styles.diagBadge}>calls: {fmt(t.diagnostics.number_of_guidance_calls)}</span>
+                            <span className={styles.diagBadge}>select: {fmt(t.diagnostics.selection_policy_used)}</span>
                             <span className={styles.diagBadge}>avg_H: {fmt(t.diagnostics.avg_masked_entropy)}</span>
+                            <span className={styles.diagBadge}>avg_sel_H: {fmt(t.diagnostics.avg_selected_entropy)}</span>
                             <span className={styles.diagBadge}>avg_w: {fmt(t.diagnostics.avg_entropy_weight)}</span>
                           </>
                         )}

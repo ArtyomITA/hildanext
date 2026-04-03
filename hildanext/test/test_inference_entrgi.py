@@ -222,5 +222,70 @@ class TestEntRGiEndToEnd(unittest.TestCase):
             self.assertTrue(torch.equal(param, params_before[name]), name)
 
 
+# ---------------------------------------------------------------------------
+# Route registration & non-regression
+# ---------------------------------------------------------------------------
+class TestEntRGiRouting(unittest.TestCase):
+    """Verify /inferenceentrgi endpoint exists and base routes still work."""
+
+    def test_inferenceentrgi_endpoint_exists(self):
+        from hildanext.api import create_app
+        from hildanext.config import AppConfig
+        app = create_app(AppConfig())
+        routes = [r.path for r in app.routes]
+        self.assertIn("/inferenceentrgi", routes)
+
+    def test_original_generate_still_exists(self):
+        from hildanext.api import create_app
+        from hildanext.config import AppConfig
+        app = create_app(AppConfig())
+        routes = [r.path for r in app.routes]
+        self.assertIn("/generate", routes)
+
+    def test_inferences2d2_still_exists(self):
+        from hildanext.api import create_app
+        from hildanext.config import AppConfig
+        app = create_app(AppConfig())
+        routes = [r.path for r in app.routes]
+        self.assertIn("/inferences2d2", routes)
+
+    def test_inferenceots_still_exists(self):
+        from hildanext.api import create_app
+        from hildanext.config import AppConfig
+        app = create_app(AppConfig())
+        routes = [r.path for r in app.routes]
+        self.assertIn("/inferenceots", routes)
+
+
+# ---------------------------------------------------------------------------
+# Stop-gradient logic (Section 3.2 of paper)
+# ---------------------------------------------------------------------------
+class TestStopGradientLogic(unittest.TestCase):
+    """Verify gradient flows through soft embedding only (paper Sec 3.2)."""
+
+    def test_gradient_flows_through_soft_path(self):
+        V = 16
+        D = 8
+        E_R = torch.randn(V, D)
+
+        psi = torch.randn(3, V, requires_grad=True)
+        q = F.softmax(psi / 0.7, dim=-1)
+        e_bar = torch.matmul(q, E_R)
+
+        with torch.no_grad():
+            sampled = torch.multinomial(q.detach(), 1).squeeze(-1)
+            e_tilde = E_R[sampled]
+            w = compute_entropy_weights(q.detach(), V)
+
+        shift = (w.unsqueeze(-1) * (e_tilde - e_bar.detach())).detach()
+        mixed = e_bar + shift
+
+        reward = mixed.sum()
+        reward.backward()
+
+        self.assertIsNotNone(psi.grad)
+        self.assertGreater(float(psi.grad.abs().sum().item()), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

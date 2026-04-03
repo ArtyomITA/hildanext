@@ -436,18 +436,22 @@ def apply_entrgi_guidance(
         if psi.grad is not None:
             with torch.no_grad():
                 psi.add_(guidance_scale * psi.grad)
-                updated_q = F.softmax(psi / temperature, dim=-1)
-                updated_e_bar = torch.matmul(updated_q, aligned_reward_embeds.to(updated_q.dtype))
-                updated_sampled = torch.multinomial(updated_q.detach(), 1).squeeze(-1)
-                updated_e_tilde = aligned_reward_embeds.index_select(0, updated_sampled).to(updated_q.dtype)
-                updated_w = compute_entropy_weights(updated_q.detach(), int(actual_token_ids.numel()))
-                updated_shift = updated_w.unsqueeze(-1) * (updated_e_tilde - updated_e_bar.detach())
-                updated_mixed = updated_e_bar + updated_shift.detach()
-                updated_scattered = idx_mat.T @ updated_mixed
-                updated_full_embeds = ((1.0 - mask_indicator) * base_embeds.to(updated_mixed.dtype) + mask_indicator * updated_scattered).unsqueeze(0)
-                reward_after = float(
-                    reward_model(inputs_embeds=updated_full_embeds, attention_mask=attn_mask).logits.squeeze().item()
-                )
+
+    # Compute reward_after once, only after the final gradient step (avoids M extra forwards).
+    if guidance_steps > 0:
+        with torch.no_grad():
+            final_q = F.softmax(psi / temperature, dim=-1)
+            final_e_bar = torch.matmul(final_q, aligned_reward_embeds.to(final_q.dtype))
+            final_sampled = torch.multinomial(final_q.detach(), 1).squeeze(-1)
+            final_e_tilde = aligned_reward_embeds.index_select(0, final_sampled).to(final_q.dtype)
+            final_w = compute_entropy_weights(final_q.detach(), int(actual_token_ids.numel()))
+            final_shift = final_w.unsqueeze(-1) * (final_e_tilde - final_e_bar)
+            final_mixed = final_e_bar + final_shift
+            final_scattered = idx_mat.T @ final_mixed
+            final_full = ((1.0 - mask_indicator) * base_embeds.to(final_mixed.dtype) + mask_indicator * final_scattered).unsqueeze(0)
+            reward_after = float(
+                reward_model(inputs_embeds=final_full, attention_mask=attn_mask).logits.squeeze().item()
+            )
 
     info["avg_entropy"] = sum(all_entropies) / max(len(all_entropies), 1)
     info["avg_w"] = sum(all_weights) / max(len(all_weights), 1)
