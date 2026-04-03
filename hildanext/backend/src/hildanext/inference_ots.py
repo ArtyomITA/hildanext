@@ -387,6 +387,8 @@ def expand_ots_candidates(
     mask_id: int,
     block_size: int,
     gumbel_temp: float,
+    *,
+    tokens_per_step: int = 0,
     force_noncausal_ctx: Any = None,
 ) -> List[Tuple[OTSBeamState, torch.Tensor, torch.Tensor]]:
     """Expand one beam into `beam_size` child candidates.
@@ -425,6 +427,10 @@ def expand_ots_candidates(
         # This enforces semi-AR generation order — earlier blocks are context,
         # later blocks are untouched until their turn.
         gen_before = child.seq[:, prompt_len:]
+        # Reveal budget per step: paper Alg.1 line 12 "Only apply L/S
+        # predicted tokens".  tokens_per_step=0 falls back to block_size
+        # for backward compatibility.
+        reveal_budget = tokens_per_step if tokens_per_step > 0 else block_size
         if blk_s < blk_e:
             gen_blk = gen_before[:, blk_s:blk_e]
             updated_blk, _ = _transfer_tokens(
@@ -432,7 +438,7 @@ def expand_ots_candidates(
                 x0_gen[:, blk_s:blk_e],
                 conf[:, blk_s:blk_e],
                 mask_id,
-                block_size,
+                reveal_budget,
             )
             updated = gen_before.clone()
             updated[:, blk_s:blk_e] = updated_blk
@@ -550,6 +556,9 @@ def ots_decode(
         n_blocks = max(2, gen_len // max(1, block_size))
         search_interval = max(1, max_steps // n_blocks)
 
+    # Paper Alg.1 line 12: reveal L/S tokens per step.
+    tokens_per_step = max(1, gen_len // max(1, max_steps))
+
     # Keep a single root beam, then branch at each block boundary.
     root = OTSBeamState(
         seq=init_seq.clone(),
@@ -586,7 +595,8 @@ def ots_decode(
                 children = expand_ots_candidates(
                     model, beam, child_count, mask_id,
                     block_size, gumbel_temperature,
-                    force_noncausal_ctx,
+                    tokens_per_step=tokens_per_step,
+                    force_noncausal_ctx=force_noncausal_ctx,
                 )
                 for child, _revealed, _x0_full in children:
                     _ensure_beam_masks(child)
@@ -617,10 +627,17 @@ def ots_decode(
                         gen_blk = gen_before[:, blk_s:blk_e]
                         updated_blk, _ = _transfer_tokens(
                             gen_blk, x0_gen[:, blk_s:blk_e],
-                            conf[:, blk_s:blk_e], mask_id, block_size,
+                            conf[:, blk_s:blk_e], mask_id, tokens_per_step,
                         )
                         updated = gen_before.clone()
                         updated[:, blk_s:blk_e] = updated_blk
+                        # Low-confidence remasking within active block (§2.2)
+                        active_blk = torch.zeros_like(updated, dtype=torch.bool)
+                        active_blk[:, blk_s:blk_e] = True
+                        updated = _apply_block_remask(
+                            updated, conf, active_blk, mask_id,
+                            target_ratio=0.2, min_ratio=0.05,
+                        )
                         beam.seq[:, prompt_len:] = updated
                     beam.step = step
                     next_beams.append(beam)

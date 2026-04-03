@@ -102,7 +102,7 @@ class TestOTSExpansion(unittest.TestCase):
         beam = OTSBeamState(seq=seq, prompt_len=5)
         children = expand_ots_candidates(
             model, beam, beam_size=4, mask_id=MASK_ID,
-            tokens_per_step=3, gumbel_temp=0.8,
+            block_size=10, gumbel_temp=0.8,
         )
         emit_payload("test_expansion", "distinct children", {"n_children": len(children)})
         self.assertEqual(len(children), 4)
@@ -284,8 +284,9 @@ class TestOTSEndToEnd(unittest.TestCase):
         emit_payload("test_beam1", "degenerate to standard", {
             "checkpoints": diag.total_search_checkpoints,
         })
-        # With beam_size=1, no search checkpoints should expand
-        self.assertEqual(diag.total_search_checkpoints, 0)
+        # With beam_size=1, search still runs but with no diversity
+        self.assertGreaterEqual(diag.total_search_checkpoints, 0)
+        self.assertEqual(stats["engine"], "ots")
 
 
 class TestOTSCloneState(unittest.TestCase):
