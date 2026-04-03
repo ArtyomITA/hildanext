@@ -194,6 +194,15 @@ function normalizeRealtimeEvent(payload: unknown): InferenceRealtimeEvent | null
   };
 }
 
+function toNumberOrNull(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 export function InferencePlusPage() {
   const [mode, setMode] = useState<InferenceMode>("RCD");
   const [turns, setTurns] = useState<TurnResult[]>([]);
@@ -244,6 +253,45 @@ export function InferencePlusPage() {
     });
     const last = items[items.length - 1];
     if (last?.id) lastInferEventIdRef.current = last.id;
+  }
+
+  function appendFrontendDiagnosticEvent(mode: InferenceMode, diagnostics: Record<string, unknown>, stats: Record<string, unknown>) {
+    if (mode !== "S2D2" || Object.keys(diagnostics).length === 0) return;
+    const routeScore = toNumberOrNull(diagnostics.last_route_score);
+    appendRealtimeEvents([
+      {
+        id: `frontend-s2d2-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        tsUtc: new Date().toISOString(),
+        level: "notice",
+        source: "frontend",
+        event: "S2D2_DIAGNOSTICS",
+        lane: "s2d2",
+        scope: "inference",
+        benchmark: null,
+        message:
+          `verify=${fmt(diagnostics.verifier_invocations)} skip=${fmt(diagnostics.verifier_skips)} ` +
+          `block=${fmt(diagnostics.last_block_index)} span=${fmt(diagnostics.last_span_start)}-${fmt(diagnostics.last_span_end)} ` +
+          `route=${routeScore == null ? "—" : routeScore.toFixed(3)} verifier=${fmt(diagnostics.verifier_mode_used)} ` +
+          `kv=${fmt(diagnostics.kv_cache_mode)} cache_hits=${fmt(diagnostics.verifier_cache_hits)}`,
+        meta: {
+          mode,
+          verifier_invocations: diagnostics.verifier_invocations,
+          verifier_skips: diagnostics.verifier_skips,
+          avg_accepted_prefix_length: diagnostics.avg_accepted_prefix_length,
+          fallback_to_diffusion_count: diagnostics.fallback_to_diffusion_count,
+          routing_policy_used: diagnostics.routing_policy_used,
+          verifier_mode_used: diagnostics.verifier_mode_used,
+          kv_cache_mode: diagnostics.kv_cache_mode,
+          verifier_cache_hits: diagnostics.verifier_cache_hits,
+          last_block_index: diagnostics.last_block_index,
+          last_span_start: diagnostics.last_span_start,
+          last_span_end: diagnostics.last_span_end,
+          last_route_score: diagnostics.last_route_score,
+          stats_verifier_mode: stats.verifier_mode,
+          stats_kv_cache_mode: stats.kv_cache_mode,
+        },
+      },
+    ]);
   }
 
   // ── Health probe on mount ──
@@ -519,6 +567,8 @@ export function InferencePlusPage() {
         throw new Error(body || `HTTP ${res.status}`);
       }
       const payload = await res.json();
+      const stats = payload.stats ?? {};
+      const diagnostics = payload.diagnostics ?? {};
       setTurns((prev) =>
         prev.map((t) =>
           t.id === id
@@ -527,13 +577,14 @@ export function InferencePlusPage() {
                 status: "success" as const,
                 text: String(payload.text ?? ""),
                 engine: String(payload.engine ?? mode),
-                stats: payload.stats ?? {},
-                diagnostics: payload.diagnostics ?? {},
+                stats,
+                diagnostics,
                 elapsedMs: elapsed,
               }
             : t,
         ),
       );
+      appendFrontendDiagnosticEvent(mode, diagnostics, stats);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         setTurns((prev) => prev.filter((t) => t.id !== id));
@@ -641,6 +692,12 @@ export function InferencePlusPage() {
                             <span className={styles.diagBadge}>fallback: {fmt(t.diagnostics.fallback_to_diffusion_count)}</span>
                             <span className={styles.diagBadge}>routing: {fmt(t.diagnostics.routing_policy_used)}</span>
                             <span className={styles.diagBadge}>block_size: {fmt(t.diagnostics.block_size)}</span>
+                            <span className={styles.diagBadge}>verifier: {fmt(t.diagnostics.verifier_mode_used)}</span>
+                            <span className={styles.diagBadge}>kv_cache: {fmt(t.diagnostics.kv_cache_mode)}</span>
+                            <span className={styles.diagBadge}>cache_hits: {fmt(t.diagnostics.verifier_cache_hits)}</span>
+                            <span className={styles.diagBadge}>last_block: {fmt(t.diagnostics.last_block_index)}</span>
+                            <span className={styles.diagBadge}>last_span: {fmt(t.diagnostics.last_span_start)}-{fmt(t.diagnostics.last_span_end)}</span>
+                            <span className={styles.diagBadge}>route_score: {fmt(t.diagnostics.last_route_score)}</span>
                           </>
                         )}
                         {t.mode === "EntRGi" && (
@@ -808,7 +865,7 @@ export function InferencePlusPage() {
                 I parametri sotto controllano quanto ramifica e come pota i candidati.
               </p>
             </div>
-          ) : (
+          ) : mode === "S2D2" ? (
             <div className={styles.explainCard}>
               <div className={styles.explainHead}>
                 <strong>Self-Speculation</strong>
@@ -832,6 +889,7 @@ export function InferencePlusPage() {
             </div>
           )}
         </div>
+        <div className={styles.block}>
           <div className={styles.fieldRow}>
             <div className={styles.field}>
               <label>Max Tokens</label>

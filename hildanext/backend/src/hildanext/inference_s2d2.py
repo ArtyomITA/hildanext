@@ -18,11 +18,24 @@
 #
 # POSITION-ALIGNED IMPLEMENTATION (LLaDA/Qwen-dLLM family):
 #   Uses the "2L trick" from Section 4.2 / Eq.(3) for verifier mask.
+#
+# *da non cancellare* — FAST-dLLM v2 TODO:
+#   Quando integreremo Fast-dLLM v2 (right-shifted model):
+#   1. Sub-block decoding (SB) va aggiunto: B fisso + SB variabile (Tab.2)
+#   2. build_block_draft_attention_mask va esteso con Eq.(4) paper:
+#      split committed prefix (causal) vs masked suffix (full) DENTRO il blocco
+#   3. Draft KV cache cross-block (Alg.1 lines 5-7) per velocità reale
+#   4. Ratio tempering γ in acceptance (Appendix A.8): (q_i/p_i)^γ
+#   5. UCB contextual bandit routing (Appendix A.6)
+#   6. Il verifier per right-shifted NON usa 2L trick: la causal mask
+#      standard basta già (Fig.1(c) paper)
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-import time
 import math as _math
+import time
+
 import torch
 import torch.nn.functional as F
 from pydantic import BaseModel, Field
@@ -54,19 +67,19 @@ class InferenceS2D2Request(BaseModel):
         default="min_span",
         description="Routing policy: min_span | score_threshold | hysteresis | always | never",
     )
-    s2d2_min_verify_span: int = Field(default=2, ge=1, le=512, description="τ_span for min-span policy (Alg.4)")
-    s2d2_score_threshold: float = Field(default=0.0, description="τ_score for score-threshold policy")
+    s2d2_min_verify_span: int = Field(default=2, ge=1, le=512, description="tau_span for min-span policy (Alg.4)")
+    s2d2_score_threshold: float = Field(default=0.0, description="tau_score for score-threshold policy")
     s2d2_score_cost: float = Field(default=1.0, ge=0.0, le=10.0, description="c — cost hyperparameter in Eq.(6)")
     s2d2_score_mode: str = Field(default="static", description="static | dynamic for Eq.(6)")
-    s2d2_hysteresis_on: float = Field(default=1.0, description="τ_on for hysteresis policy")
-    s2d2_hysteresis_off: float = Field(default=-5.0, description="τ_off for hysteresis policy")
+    s2d2_hysteresis_on: float = Field(default=1.0, description="tau_on for hysteresis policy")
+    s2d2_hysteresis_off: float = Field(default=-5.0, description="tau_off for hysteresis policy")
     s2d2_acceptance_estimator: str = Field(
         default="entropy",
         description="Token acceptance estimator: entropy | margin (Sec 4.3, Eq.5)",
     )
-    s2d2_entropy_beta: float = Field(default=1.0, ge=0.01, le=10.0, description="β for entropy estimator α_i = exp(-β H̃_i)")
-    s2d2_margin_threshold: float = Field(default=0.1, ge=0.0, le=1.0, description="τ_margin for margin estimator")
-    s2d2_confidence_threshold: float = Field(default=0.3, ge=0.0, le=1.0, description="τ — confidence threshold for diffusion fallback (Alg.2/3)")
+    s2d2_entropy_beta: float = Field(default=1.0, ge=0.01, le=10.0, description="beta for entropy estimator alpha_i = exp(-beta H_tilde_i)")
+    s2d2_margin_threshold: float = Field(default=0.1, ge=0.0, le=1.0, description="tau_margin for margin estimator")
+    s2d2_confidence_threshold: float = Field(default=0.3, ge=0.0, le=1.0, description="tau — confidence threshold for diffusion fallback (Alg.2/3)")
     s2d2_store_diagnostics: bool = Field(default=True)
 
 
@@ -76,14 +89,33 @@ class InferenceS2D2Request(BaseModel):
 @dataclass
 class S2D2StepDiag:
     step: int
+    block_index: int
+    block_start: int
+    block_end: int
     masked_before: int
     contiguous_span_len: int
+    span_start: int
+    span_end: int
+    route_score: float
     verify_invoked: bool
+    verifier_mode: str
+    verifier_input_tokens: int
+    verifier_cache_used: bool
     accepted_count: int
-    rejection_position: int  # -1 if no rejection
+    rejection_position: int
     committed_count: int
     masked_after: int
     elapsed_ms: float
+
+
+@dataclass
+class S2D2VerifierInputs:
+    input_ids: torch.Tensor
+    query_start: int
+    query_end: int
+    attention_mask_bool: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+    verifier_mode: str = "position_aligned_2l"
 
 
 @dataclass
@@ -99,17 +131,34 @@ class S2D2Diagnostics:
     routing_policy_used: str = "min_span"
     acceptance_estimator_used: str = "entropy"
     fallback_to_diffusion_count: int = 0
-    verifier_mask_path: str = "position_aligned_2n"
+    verifier_mask_path: str = "position_aligned_2l"
+    verifier_mode_used: str = "position_aligned_2l"
     block_size: int = 32
+    kv_cache_mode: str = "disabled"
+    verifier_cache_prefills: int = 0
+    verifier_cache_hits: int = 0
+    last_route_score: float = 0.0
+    last_block_index: int = -1
+    last_span_start: int = -1
+    last_span_end: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "steps": [
                 {
                     "step": s.step,
+                    "block_index": s.block_index,
+                    "block_start": s.block_start,
+                    "block_end": s.block_end,
                     "masked_before": s.masked_before,
                     "contiguous_span_len": s.contiguous_span_len,
+                    "span_start": s.span_start,
+                    "span_end": s.span_end,
+                    "route_score": s.route_score,
                     "verify_invoked": s.verify_invoked,
+                    "verifier_mode": s.verifier_mode,
+                    "verifier_input_tokens": s.verifier_input_tokens,
+                    "verifier_cache_used": s.verifier_cache_used,
                     "accepted_count": s.accepted_count,
                     "rejection_position": s.rejection_position,
                     "committed_count": s.committed_count,
@@ -129,39 +178,43 @@ class S2D2Diagnostics:
             "acceptance_estimator_used": self.acceptance_estimator_used,
             "fallback_to_diffusion_count": self.fallback_to_diffusion_count,
             "verifier_mask_path": self.verifier_mask_path,
+            "verifier_mode_used": self.verifier_mode_used,
             "block_size": self.block_size,
+            "kv_cache_mode": self.kv_cache_mode,
+            "verifier_cache_prefills": self.verifier_cache_prefills,
+            "verifier_cache_hits": self.verifier_cache_hits,
+            "last_route_score": self.last_route_score,
+            "last_block_index": self.last_block_index,
+            "last_span_start": self.last_span_start,
+            "last_span_end": self.last_span_end,
         }
 
 
 # ---------------------------------------------------------------------------
-# Pure helper functions — paper-faithful
+# Pure helper functions
 # ---------------------------------------------------------------------------
-
 def find_first_contiguous_mask_span(
     seq: torch.Tensor,
     mask_id: int,
     prompt_len: int,
+    region_end: Optional[int] = None,
 ) -> Tuple[int, int]:
-    """Find the first contiguous span of [MASK] tokens in the generation region.
-    Returns (start, end) indices in seq coordinates. end is exclusive.
-    If no masked tokens remain, returns (-1, -1).
-    Paper Section 4.1: "optionally verifies the first contiguous masked span C_t".
-    """
-    gen_region = seq[0, prompt_len:]  # (gen_len,)
-    is_mask = gen_region.eq(mask_id)
+    """Find the first contiguous [MASK] span in seq[prompt_len:region_end]."""
+    end = int(region_end) if region_end is not None else int(seq.shape[1])
+    if end <= prompt_len:
+        return -1, -1
+    region = seq[0, prompt_len:end]
+    is_mask = region.eq(mask_id)
     if not is_mask.any():
         return -1, -1
-    # Find first masked position
     nonzero = is_mask.nonzero(as_tuple=False).view(-1)
     if nonzero.numel() == 0:
         return -1, -1
-    start_gen = int(nonzero[0].item())
-    # Extend contiguous span
-    end_gen = start_gen + 1
-    gen_len = gen_region.shape[0]
-    while end_gen < gen_len and is_mask[end_gen]:
-        end_gen += 1
-    return prompt_len + start_gen, prompt_len + end_gen
+    start_local = int(nonzero[0].item())
+    end_local = start_local + 1
+    while end_local < region.shape[0] and bool(is_mask[end_local]):
+        end_local += 1
+    return prompt_len + start_local, prompt_len + end_local
 
 
 def estimate_expected_accept_prefix(
@@ -173,18 +226,14 @@ def estimate_expected_accept_prefix(
     margin_threshold: float = 0.1,
     vocab_size: int = 1,
 ) -> float:
-    """Estimate expected accepted prefix length K̂ via Eq.(5).
-    K̂ = Σ_{k=1}^{L} Π_{i=1}^{k} α_i
-    where α_i is estimated via entropy- or margin-based proxy.
-    """
-    span_logits = draft_logits[0, span_start:span_end, :]  # (L, V)
+    """Estimate expected accepted prefix length K_hat via Eq.(5)."""
+    span_logits = draft_logits[0, span_start:span_end, :]
     L = span_logits.shape[0]
     if L == 0:
         return 0.0
     probs = F.softmax(span_logits.float(), dim=-1)
 
     if estimator == "margin":
-        # α_i = 1[m_i ≥ τ_margin]  where m_i = top1 - top2
         top2_vals, _ = probs.topk(min(2, probs.shape[-1]), dim=-1)
         if top2_vals.shape[-1] >= 2:
             margins = top2_vals[:, 0] - top2_vals[:, 1]
@@ -192,17 +241,13 @@ def estimate_expected_accept_prefix(
             margins = torch.ones(L, device=probs.device)
         alphas = (margins >= margin_threshold).float()
     else:
-        # Entropy-based: α_i = exp(-β H̃_i)  where H̃_i = H_i / log(V)
         log_v = _math.log(max(vocab_size, 2))
         p_clamped = probs.clamp(min=1e-12)
-        H = -(p_clamped * p_clamped.log()).sum(dim=-1)  # (L,)
+        H = -(p_clamped * p_clamped.log()).sum(dim=-1)
         H_tilde = H / log_v
         alphas = torch.exp(-entropy_beta * H_tilde)
 
-    # K̂ = Σ_{k=1}^{L} Π_{i=1}^{k} α_i
-    cum_prod = torch.cumprod(alphas, dim=0)  # (L,)
-    k_hat = float(cum_prod.sum().item())
-    return k_hat
+    return float(torch.cumprod(alphas, dim=0).sum().item())
 
 
 def compute_verification_score(
@@ -211,7 +256,7 @@ def compute_verification_score(
     n_hi: int = 0,
     mode: str = "static",
 ) -> float:
-    """Eq.(6): s = K̂ - c  (static)  or  s = K̂ - c·N_hi  (dynamic)."""
+    """Eq.(6): s = K_hat - c  (static)  or  s = K_hat - c*N_hi  (dynamic)."""
     if mode == "dynamic":
         return k_hat - cost * n_hi
     return k_hat - cost
@@ -240,25 +285,24 @@ def route_s2d2_verification(
     margin_threshold: float,
     vocab_size: int,
 ) -> Tuple[bool, bool, float]:
-    """Algorithm 4: DOVERIFY routing decision.
-    Returns (do_verify, new_hysteresis_state, score).
-    """
+    """Algorithm 4: DOVERIFY routing decision."""
+    del mask_id
     if policy == "always":
         return True, hysteresis_state, 0.0
     if policy == "never":
         return False, hysteresis_state, 0.0
-
-    # Minimum-span policy (simplest, often surprisingly effective)
     if policy == "min_span":
         return span_len >= min_verify_span, hysteresis_state, float(span_len)
 
-    # Compute K̂ for score-based policies
     k_hat = estimate_expected_accept_prefix(
-        draft_logits, span_start, span_end,
-        estimator=estimator, entropy_beta=entropy_beta,
-        margin_threshold=margin_threshold, vocab_size=vocab_size,
+        draft_logits,
+        span_start,
+        span_end,
+        estimator=estimator,
+        entropy_beta=entropy_beta,
+        margin_threshold=margin_threshold,
+        vocab_size=vocab_size,
     )
-    # Count high-confidence tokens in masked positions for dynamic scoring
     n_hi = 0
     if score_mode == "dynamic" and confidence is not None and mask_positions is not None:
         n_hi = int((confidence[mask_positions] > tau).sum().item()) if mask_positions.numel() > 0 else 0
@@ -266,17 +310,88 @@ def route_s2d2_verification(
 
     if policy == "score_threshold":
         return score >= score_threshold, hysteresis_state, score
-
     if policy == "hysteresis":
         new_state = hysteresis_state
         if hysteresis_state and score < hysteresis_off:
             new_state = False
-        elif not hysteresis_state and score >= hysteresis_on:
+        elif (not hysteresis_state) and score >= hysteresis_on:
             new_state = True
         return new_state, new_state, score
+    return True, hysteresis_state, score
 
-    # Fallback: always verify if unknown policy
-    return True, hysteresis_state, 0.0
+
+def _attn_for_model(mask: torch.Tensor, model: Any) -> torch.Tensor:
+    m = mask.bool()
+    if m.dim() == 2:
+        m = m.unsqueeze(0)
+    if m.dim() == 3:
+        m = m[:, None, :, :]
+    dtype = torch.float32
+    try:
+        dtype = next(model.parameters()).dtype
+    except Exception:
+        dtype = torch.float32
+    out = torch.zeros(m.shape, device=m.device, dtype=dtype)
+    return out.masked_fill(~m, torch.finfo(dtype).min)
+
+
+def _model_name_candidates(model: Any, tokenizer: Any = None) -> List[str]:
+    out: List[str] = []
+    for obj in (model, getattr(model, "config", None), tokenizer):
+        if obj is None:
+            continue
+        for attr in ("name_or_path", "_name_or_path", "model_type"):
+            value = getattr(obj, attr, None)
+            if isinstance(value, str) and value:
+                out.append(value.lower())
+        cls_name = obj.__class__.__name__
+        if isinstance(cls_name, str):
+            out.append(cls_name.lower())
+    return out
+
+
+def detect_s2d2_verifier_mode(model: Any, tokenizer: Any = None) -> str:
+    """Detect verifier mode from model name.
+
+    *da non cancellare* — Fast-dLLM v2 reminder:
+    Quando aggiungiamo Fast-dLLM v2 il path "right_shifted_ar" si attiverà.
+    Serve verificare che il sequential AR verifier con KV cache funzioni
+    correttamente con l'architettura right-shifted (la causal mask standard
+    del modello fornisce già la vista verifier, Fig.1(c) paper).
+    Testare anche sub-block caching che per Fast-dLLM "is not lossless" (§5.1).
+    """
+    names = _model_name_candidates(model, tokenizer)
+    if any(("dream" in x) or ("fast-dllm" in x) or ("fast_dllm" in x) for x in names):
+        return "right_shifted_ar"
+    if any(("llada" in x) or ("qwen" in x) or ("sdar" in x) for x in names):
+        return "position_aligned_2l"
+    return "position_aligned_2l"
+
+
+def build_block_draft_attention_mask(
+    seq_len: int,
+    block_start: int,
+    block_end: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Block-wise draft mask: causal prefix, fully-visible current block.
+
+    *da non cancellare* — Eq.(4) paper reminder:
+    Questa è una versione semplificata: tutto il blocco è fully-visible.
+    L'Eq.(4) del paper prevede di splittare il blocco in committed prefix
+    x^b_{<j} (causal A_j) e masked suffix (fully-visible 1_{B-j,B-j}).
+    Quando implementeremo Fast-dLLM v2 / partially-causal drafting,
+    aggiungere parametro `first_masked_in_block: int` e costruire la mask
+    M_draft^(j) come da paper Section 4.2.
+    """
+    mask = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=device)
+    if block_start > 0:
+        prefix_tri = torch.tril(torch.ones((block_start, block_start), dtype=torch.bool, device=device))
+        mask[:block_start, :block_start] = prefix_tri
+    if block_end > block_start:
+        mask[block_start:block_end, :block_start] = True
+        mask[block_start:block_end, block_start:block_end] = True
+    return mask.unsqueeze(0)
 
 
 def build_verifier_inputs_position_aligned(
@@ -285,83 +400,221 @@ def build_verifier_inputs_position_aligned(
     span_start: int,
     span_end: int,
     full_seq: torch.Tensor,
-) -> torch.Tensor:
-    """Build verifier input for position-aligned models using the "2L trick" (Sec 4.2, Eq.3).
-    For a span of length L, we concatenate:
-      [drafted tokens at span positions] + [MASK × L at same positions]
-    The full sequence context before the span is kept,
-    and we construct the input so that the second L positions see
-    only causal (left-to-right) context from the first L positions.
+) -> S2D2VerifierInputs:
+    """Paper-faithful 2L verifier input for position-aligned dLLMs."""
+    L = int(span_end - span_start)
+    prefix = full_seq[:, :span_start]
+    drafted = drafted_tokens.view(1, L)
+    query = torch.full((1, L), mask_id, dtype=full_seq.dtype, device=full_seq.device)
+    input_ids = torch.cat([prefix, drafted, query], dim=1)
 
-    For our implementation within a full-sequence bidirectional dLLM,
-    we approximate this by constructing a verifier sequence where:
-    - positions before span_start: keep committed tokens (context)
-    - span positions: fill with drafted tokens
-    - positions after span_end: keep as-is
-    Then we run this sequence through the model with noncausal attention
-    and use the logits at span positions as verifier probabilities.
+    prefix_len = int(prefix.shape[1])
+    total_len = int(prefix_len + 2 * L)
+    mask = torch.zeros((total_len, total_len), dtype=torch.bool, device=full_seq.device)
 
-    This is equivalent to the "single forward on drafted sequence" approach
-    for position-aligned models because our model is bidirectional.
-    """
-    ver_seq = full_seq.clone()
-    ver_seq[0, span_start:span_end] = drafted_tokens
-    return ver_seq
+    if prefix_len > 0:
+        mask[:prefix_len, :prefix_len] = torch.tril(
+            torch.ones((prefix_len, prefix_len), dtype=torch.bool, device=full_seq.device)
+        )
+
+    drafted_start = prefix_len
+    query_start = prefix_len + L
+    for i in range(L):
+        row_d = drafted_start + i
+        row_q = query_start + i
+        if prefix_len > 0:
+            mask[row_d, :prefix_len] = True
+            mask[row_q, :prefix_len] = True
+        mask[row_d, drafted_start : drafted_start + i + 1] = True
+        if i > 0:
+            mask[row_q, drafted_start : drafted_start + i] = True
+        mask[row_q, row_q] = True
+
+    pos_prefix = torch.arange(prefix_len, device=full_seq.device, dtype=torch.long)
+    pos_local = torch.arange(span_start, span_end, device=full_seq.device, dtype=torch.long)
+    position_ids = torch.cat([pos_prefix, pos_local, pos_local], dim=0).unsqueeze(0)
+
+    return S2D2VerifierInputs(
+        input_ids=input_ids,
+        query_start=query_start,
+        query_end=query_start + L,
+        attention_mask_bool=mask.unsqueeze(0),
+        position_ids=position_ids,
+        verifier_mode="position_aligned_2l",
+    )
+
+
+def _prefill_causal_cache(model: Any, prefix_ids: torch.Tensor) -> Tuple[Any, Optional[torch.Tensor]]:
+    if prefix_ids.shape[1] == 0:
+        return None, None
+    out = model(input_ids=prefix_ids, use_cache=True)
+    return getattr(out, "past_key_values", None), out.logits[:, -1, :]
+
+
+def _extend_causal_cache(
+    model: Any,
+    past_kv: Any,
+    next_logits: Optional[torch.Tensor],
+    tokens: torch.Tensor,
+) -> Tuple[Any, Optional[torch.Tensor]]:
+    logits = next_logits
+    cache = past_kv
+    for i in range(tokens.shape[1]):
+        tok = tokens[:, i : i + 1]
+        if cache is None:
+            out = model(input_ids=tok, use_cache=True)
+        else:
+            out = model(input_ids=tok, past_key_values=cache, use_cache=True)
+        cache = getattr(out, "past_key_values", None)
+        logits = out.logits[:, -1, :]
+    return cache, logits
+
+
+def _clone_past_key_values(past_kv: Any) -> Any:
+    if past_kv is None:
+        return None
+    cloned = []
+    for layer in past_kv:
+        if isinstance(layer, (tuple, list)):
+            cloned.append(tuple(x.clone() if torch.is_tensor(x) else x for x in layer))
+        else:
+            cloned.append(layer)
+    return tuple(cloned)
+
+
+def _past_seq_len(past_kv: Any) -> int:
+    if past_kv is None or len(past_kv) == 0:
+        return 0
+    layer0 = past_kv[0]
+    if isinstance(layer0, (tuple, list)):
+        for item in layer0:
+            if torch.is_tensor(item) and item.ndim >= 3:
+                return int(item.shape[-2])
+    return 0
+
+
+def _draft_forward_block(
+    *,
+    model: Any,
+    seq: torch.Tensor,
+    block_start: int,
+    block_end: int,
+    force_noncausal_ctx: Any = None,
+) -> Any:
+    draft_mask = build_block_draft_attention_mask(seq.shape[1], block_start, block_end, seq.device)
+    attn4d = _attn_for_model(draft_mask, model)
+    if force_noncausal_ctx is not None:
+        with force_noncausal_ctx(model):
+            return model(input_ids=seq, attention_mask=attn4d)
+    return model(input_ids=seq, attention_mask=attn4d)
 
 
 def run_s2d2_verification(
     *,
     model: Any,
-    verifier_seq: torch.Tensor,
+    verifier_inputs: S2D2VerifierInputs,
     draft_probs: torch.Tensor,
     drafted_ids: torch.Tensor,
     span_start: int,
     span_end: int,
     force_noncausal_ctx: Any = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Algorithm 3 lines 10–25: speculative verification with rejection sampling.
-    Uses the SAME model in verifier mode on a sequence with drafted tokens filled in.
-    Returns: (accepted_ids, verifier_logits, accepted_count, rejection_pos)
-    - accepted_count: number of tokens accepted left-to-right
-    - rejection_pos: position of rejection in span, or -1 if all accepted
-    """
-    L = span_end - span_start
+    block_prefix_cache: Any = None,
+    block_prefix_next_logits: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int, bool]:
+    """Algorithm 3 lines 10–25: speculative verification with rejection sampling."""
+    L = int(span_end - span_start)
     if L == 0:
-        return drafted_ids, torch.zeros(0), 0, -1
+        return drafted_ids, torch.zeros(0), 0, -1, False
 
     model.eval()
+    verifier_cache_used = False
+
+    if verifier_inputs.verifier_mode == "right_shifted_ar":
+        draft_span_probs = draft_probs[0, span_start:span_end, :]
+        accepted_ids = drafted_ids.clone()
+        accepted_count = 0
+        rejection_pos = -1
+        prefix_ids = verifier_inputs.input_ids
+
+        if block_prefix_cache is not None and block_prefix_next_logits is not None:
+            cache = _clone_past_key_values(block_prefix_cache)
+            logits = block_prefix_next_logits.clone()
+            verifier_cache_used = True
+            extra_prefix = prefix_ids[:, _past_seq_len(block_prefix_cache) :]
+            if extra_prefix.shape[1] > 0:
+                cache, logits = _extend_causal_cache(model, cache, logits, extra_prefix)
+        else:
+            cache, logits = _prefill_causal_cache(model, prefix_ids)
+
+        ver_token_logits: List[torch.Tensor] = []
+        for i in range(L):
+            if logits is None:
+                if prefix_ids.shape[1] == 0:
+                    seed_tok = drafted_ids[i : i + 1].view(1, 1)
+                    out = model(input_ids=seed_tok, use_cache=True)
+                    cache = getattr(out, "past_key_values", None)
+                    logits = out.logits[:, -1, :]
+                else:
+                    cache, logits = _prefill_causal_cache(model, prefix_ids)
+            ver_token_logits.append(logits.squeeze(0))
+            token_id = int(drafted_ids[i].item())
+            p_i = max(float(draft_span_probs[i, token_id].item()), 1e-12)
+            q_probs = F.softmax(logits.float(), dim=-1)
+            q_i = float(q_probs[0, token_id].item())
+            ratio = min(1.0, q_i / p_i)
+            r = float(torch.rand(1, device=logits.device).item())
+            if r < ratio:
+                accepted_count += 1
+                out = model(input_ids=drafted_ids[i : i + 1].view(1, 1), past_key_values=cache, use_cache=True)
+                cache = getattr(out, "past_key_values", None)
+                logits = out.logits[:, -1, :]
+            else:
+                rejection_pos = i
+                residual = (q_probs[0] - draft_span_probs[i]).clamp(min=0.0)
+                residual_sum = residual.sum()
+                if residual_sum > 1e-12:
+                    residual = residual / residual_sum
+                    resampled_id = int(torch.multinomial(residual, 1).item())
+                else:
+                    resampled_id = int(torch.multinomial(q_probs[0], 1).item())
+                accepted_ids[i] = resampled_id
+                break
+        ver_logits = torch.stack(ver_token_logits, dim=0) if ver_token_logits else torch.zeros((0, draft_probs.shape[-1]))
+        return accepted_ids, ver_logits, accepted_count, rejection_pos, verifier_cache_used
+
+    attn4d = None
+    if verifier_inputs.attention_mask_bool is not None:
+        attn4d = _attn_for_model(verifier_inputs.attention_mask_bool, model)
+
     with torch.inference_mode():
+        kwargs: Dict[str, Any] = {"input_ids": verifier_inputs.input_ids}
+        if attn4d is not None:
+            kwargs["attention_mask"] = attn4d
+        if verifier_inputs.position_ids is not None:
+            kwargs["position_ids"] = verifier_inputs.position_ids
         if force_noncausal_ctx is not None:
             with force_noncausal_ctx(model):
-                out = model(input_ids=verifier_seq)
+                out = model(**kwargs)
         else:
-            out = model(input_ids=verifier_seq)
+            out = model(**kwargs)
 
-    ver_logits = out.logits  # (1, S, V)
-    ver_span_logits = ver_logits[0, span_start:span_end, :]  # (L, V)
-    ver_probs = F.softmax(ver_span_logits.float(), dim=-1)  # (L, V)
-    draft_span_probs = draft_probs[0, span_start:span_end, :]  # (L, V)
-
-    # Speculative rejection sampling: left-to-right (Algorithm 3 lines 14–24)
-    accepted_ids = drafted_ids.clone()  # (L,)
+    ver_logits = out.logits
+    ver_span_logits = ver_logits[0, verifier_inputs.query_start : verifier_inputs.query_end, :]
+    ver_probs = F.softmax(ver_span_logits.float(), dim=-1)
+    draft_span_probs = draft_probs[0, span_start:span_end, :]
+    accepted_ids = drafted_ids.clone()
     accepted_count = 0
     rejection_pos = -1
 
     for i in range(L):
         token_id = int(drafted_ids[i].item())
-        p_i = float(draft_span_probs[i, token_id].item())
+        p_i = max(float(draft_span_probs[i, token_id].item()), 1e-12)
         q_i = float(ver_probs[i, token_id].item())
-
-        # Acceptance probability: min(1, q_i / p_i) — Eq.(8), Algorithm 3 line 16
-        p_i = max(p_i, 1e-12)
         ratio = min(1.0, q_i / p_i)
-        r = float(torch.rand(1).item())
-
+        r = float(torch.rand(1, device=ver_probs.device).item())
         if r < ratio:
-            # Accept (Algorithm 3 line 17)
             accepted_count += 1
         else:
-            # Reject: resample from residual distribution (P_ver - P_draft)+ (line 19)
             rejection_pos = i
             residual = (ver_probs[i] - draft_span_probs[i]).clamp(min=0.0)
             residual_sum = residual.sum()
@@ -369,19 +622,15 @@ def run_s2d2_verification(
                 residual = residual / residual_sum
                 resampled_id = int(torch.multinomial(residual, 1).item())
             else:
-                # Fallback: sample from verifier distribution
                 resampled_id = int(torch.multinomial(ver_probs[i], 1).item())
             accepted_ids[i] = resampled_id
-            # Stop speculative segment (line 22: break)
             break
-
-    return accepted_ids, ver_logits, accepted_count, rejection_pos
+    return accepted_ids, ver_span_logits, accepted_count, rejection_pos, verifier_cache_used
 
 
 # ---------------------------------------------------------------------------
 # S2D2 decode loop — Algorithm 3
 # ---------------------------------------------------------------------------
-
 def s2d2_decode(
     *,
     model: Any,
@@ -412,37 +661,32 @@ def s2d2_decode(
     is_dummy: bool = False,
     force_noncausal_ctx: Any = None,
 ) -> Tuple[str, Dict[str, Any], S2D2Diagnostics]:
-    """Full S2D2 inference loop implementing Algorithm 3.
-    The SAME model serves as both drafter (block-diffusion) and verifier (AR mode).
-    Returns: (text, stats_dict, diagnostics).
-    """
+    """Full S2D2 inference loop implementing Algorithm 3 block-wise."""
     from .utils import seed_everything, tokens_per_second
 
+    del tau_mask, tau_edit
+
     seed_everything(seed)
+    verifier_mode = detect_s2d2_verifier_mode(model, tokenizer)
     diag = S2D2Diagnostics(
         routing_policy_used=routing_policy,
         acceptance_estimator_used=acceptance_estimator,
         block_size=block_size,
+        verifier_mode_used=verifier_mode,
+        verifier_mask_path="position_aligned_2l" if verifier_mode == "position_aligned_2l" else "right_shifted_ar",
+        kv_cache_mode="block_prefix_verifier" if verifier_mode == "right_shifted_ar" else "disabled",
     )
 
-    # Encode prompt
     enc = tokenizer([prompt], return_tensors="pt")
-    input_ids = enc["input_ids"].to(device)
-    prompt_len = int(input_ids.shape[1])
+    seq = enc["input_ids"].to(device)
+    prompt_len = int(seq.shape[1])
 
-    # Build sequence: [prompt tokens] [MASK × max_new_tokens]
-    seq = torch.full((1, prompt_len + max_new_tokens), mask_id, dtype=torch.long, device=device)
-    seq[:, :prompt_len] = input_ids
-
-    # Determine effective denoising steps per block
     T = denoising_steps_per_block if denoising_steps_per_block > 0 else max(1, max_steps)
-
-    # Total number of blocks to process = ceil(max_new_tokens / block_size)
     total_blocks = max(1, _math.ceil(max_new_tokens / block_size))
 
     model.eval()
     t0 = time.time()
-    hysteresis_state = False  # paper Algorithm 4: starts OFF
+    hysteresis_state = False
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     if eos_token_id is not None:
         try:
@@ -455,54 +699,61 @@ def s2d2_decode(
     total_step_counter = 0
 
     with torch.inference_mode():
-        # Block-wise autoregressive outer loop (Algorithm 1)
         for block_idx in range(total_blocks):
-            blk_start = prompt_len + block_idx * block_size
-            blk_end = min(prompt_len + (block_idx + 1) * block_size, prompt_len + max_new_tokens)
-            if blk_start >= seq.shape[1]:
+            remaining = int(max_new_tokens - max(0, seq.shape[1] - prompt_len))
+            if remaining <= 0:
                 break
+            current_block_size = min(int(block_size), remaining)
+            new_block = torch.full((1, current_block_size), mask_id, dtype=torch.long, device=device)
+            blk_start = int(seq.shape[1])
+            seq = torch.cat([seq, new_block], dim=1)
+            blk_end = int(seq.shape[1])
 
-            # Inner denoising loop per block (Algorithm 3 lines 1–31)
-            for t in range(T):
+            block_prefix_cache = None
+            block_prefix_next_logits = None
+            if verifier_mode == "right_shifted_ar" and blk_start > 0 and hasattr(model, "forward"):
+                try:
+                    block_prefix_cache, block_prefix_next_logits = _prefill_causal_cache(model, seq[:, :blk_start])
+                    if block_prefix_cache is not None:
+                        diag.verifier_cache_prefills += 1
+                except Exception:
+                    block_prefix_cache, block_prefix_next_logits = None, None
+
+            block_converged = False
+            for _ in range(T):
                 step_t0 = time.time()
                 total_step_counter += 1
 
-                # Check: any MASK left in this block?
                 block_seq = seq[0, blk_start:blk_end]
                 is_mask_block = block_seq.eq(mask_id)
                 masked_before = int(is_mask_block.sum().item())
                 if masked_before == 0:
+                    block_converged = True
                     break
 
-                # ─── DRAFT FORWARD (Algorithm 3 line 5) ───
-                if force_noncausal_ctx is not None:
-                    with force_noncausal_ctx(model):
-                        draft_out = model(input_ids=seq)
-                else:
-                    draft_out = model(input_ids=seq)
-                logits = draft_out.logits  # (1, S, V)
-
-                # Draft proposals (line 6): (x̂, p) ← SampleFromLogits(ℓ)
+                draft_out = _draft_forward_block(
+                    model=model,
+                    seq=seq,
+                    block_start=blk_start,
+                    block_end=blk_end,
+                    force_noncausal_ctx=force_noncausal_ctx,
+                )
+                logits = draft_out.logits
                 probs = F.softmax(logits.float(), dim=-1)
-                confidence, pred_ids = probs.max(dim=-1)  # (1, S)
+                confidence, pred_ids = probs.max(dim=-1)
 
-                # ─── FIND FIRST CONTIGUOUS MASK SPAN (line 8) ───
-                span_start, span_end = find_first_contiguous_mask_span(seq, mask_id, prompt_len)
+                span_start, span_end = find_first_contiguous_mask_span(seq, mask_id, blk_start, blk_end)
                 contiguous_span_len = max(0, span_end - span_start) if span_start >= 0 else 0
+                block_confidence = confidence[0, blk_start:blk_end]
+                mask_positions_block = is_mask_block.nonzero(as_tuple=False).view(-1)
 
-                # Masked positions M_t (line 7)
-                gen_region = seq[0, prompt_len:]
-                gen_is_mask = gen_region.eq(mask_id)
-                mask_positions_gen = gen_is_mask.nonzero(as_tuple=False).view(-1)
-
-                # ─── ROUTING DECISION (Algorithm 4, line 9) ───
                 do_verify, hysteresis_state, route_score = route_s2d2_verification(
                     span_len=contiguous_span_len,
                     draft_logits=logits,
-                    span_start=span_start if span_start >= 0 else 0,
-                    span_end=span_end if span_end >= 0 else 0,
-                    confidence=confidence[0, prompt_len:],
-                    mask_positions=mask_positions_gen,
+                    span_start=span_start if span_start >= 0 else blk_start,
+                    span_end=span_end if span_end >= 0 else blk_start,
+                    confidence=block_confidence,
+                    mask_positions=mask_positions_block,
                     mask_id=mask_id,
                     tau=confidence_threshold,
                     policy=routing_policy,
@@ -522,108 +773,128 @@ def s2d2_decode(
                 accepted_count = 0
                 rejection_pos = -1
                 committed_this_step = 0
+                verifier_input_tokens = 0
+                verifier_cache_used = False
 
                 if do_verify and span_start >= 0 and contiguous_span_len > 0:
-                    # ─── SELF-SPECULATIVE VERIFICATION (Algorithm 3 lines 10–25) ───
                     diag.verifier_invocations += 1
-
-                    # Build verifier input (line 10): x̃^b ← x^b, x̃^b_{C_t} ← x̂_{C_t}
                     drafted_ids = pred_ids[0, span_start:span_end]
-                    verifier_seq = build_verifier_inputs_position_aligned(
-                        drafted_ids, mask_id, span_start, span_end, seq,
-                    )
+                    if verifier_mode == "position_aligned_2l":
+                        verifier_inputs = build_verifier_inputs_position_aligned(
+                            drafted_ids,
+                            mask_id,
+                            span_start,
+                            span_end,
+                            seq,
+                        )
+                    else:
+                        verifier_inputs = S2D2VerifierInputs(
+                            input_ids=seq[:, :span_start].clone(),
+                            query_start=0,
+                            query_end=contiguous_span_len,
+                            verifier_mode="right_shifted_ar",
+                        )
+                    verifier_input_tokens = int(verifier_inputs.input_ids.shape[1])
 
-                    # Run verification (lines 11–24): same model as verifier
-                    accepted_ids, _ver_logits, accepted_count, rejection_pos = run_s2d2_verification(
+                    accepted_ids, _ver_logits, accepted_count, rejection_pos, verifier_cache_used = run_s2d2_verification(
                         model=model,
-                        verifier_seq=verifier_seq,
+                        verifier_inputs=verifier_inputs,
                         draft_probs=probs,
                         drafted_ids=drafted_ids,
                         span_start=span_start,
                         span_end=span_end,
                         force_noncausal_ctx=force_noncausal_ctx,
+                        block_prefix_cache=block_prefix_cache,
+                        block_prefix_next_logits=block_prefix_next_logits,
                     )
+                    if verifier_cache_used:
+                        diag.verifier_cache_hits += 1
 
-                    # Commit accepted tokens (line 25): x^b_{S_t} ← x̂_{S_t}
                     if rejection_pos < 0:
-                        # All accepted
                         seq[0, span_start:span_end] = accepted_ids
                         committed_this_step = contiguous_span_len
                     else:
-                        # Accept up to rejection, commit resampled token at rejection
                         commit_end = span_start + rejection_pos + 1
-                        seq[0, span_start:commit_end] = accepted_ids[:rejection_pos + 1]
+                        seq[0, span_start:commit_end] = accepted_ids[: rejection_pos + 1]
                         committed_this_step = rejection_pos + 1
-
                     diag.accepted_prefix_lengths.append(accepted_count)
-
                 else:
-                    # ─── FALLBACK: standard confidence-threshold decoding (Algorithm 3 lines 26–29) ───
                     diag.verifier_skips += 1
                     diag.fallback_to_diffusion_count += 1
-
-                    # S_t ← {i ∈ M_t : p_i > τ}  (line 27)
-                    gen_confidence = confidence[0, prompt_len:]
-                    gen_pred_ids = pred_ids[0, prompt_len:]
-                    selected = gen_is_mask & gen_confidence.ge(confidence_threshold)
-
-                    # S_t ← S_t ∪ {argmax_{i ∈ M_t} p_i}  (line 28: always commit at least one)
-                    if gen_is_mask.any() and not selected.any():
-                        best_idx = gen_confidence.clone()
-                        best_idx[~gen_is_mask] = -float("inf")
+                    block_pred_ids = pred_ids[0, blk_start:blk_end]
+                    selected = is_mask_block & block_confidence.ge(confidence_threshold)
+                    if is_mask_block.any() and not selected.any():
+                        best_idx = block_confidence.clone()
+                        best_idx[~is_mask_block] = -float("inf")
                         best_pos = int(best_idx.argmax().item())
                         selected[best_pos] = True
-
-                    # x^b_{S_t} ← x̂_{S_t}  (line 29)
                     if selected.any():
-                        gen_region[selected] = gen_pred_ids[selected]
-                        seq[0, prompt_len:] = gen_region
+                        updated_block = seq[0, blk_start:blk_end].clone()
+                        updated_block[selected] = block_pred_ids[selected]
+                        seq[0, blk_start:blk_end] = updated_block
                         committed_this_step = int(selected.sum().item())
 
-                # ─── Diagnostics ───
-                masked_after = int(seq[0, prompt_len:].eq(mask_id).sum().item())
+                masked_after = int(seq[0, blk_start:blk_end].eq(mask_id).sum().item())
                 step_elapsed = (time.time() - step_t0) * 1000.0
 
-                if store_diagnostics:
-                    diag.steps.append(S2D2StepDiag(
-                        step=total_step_counter,
-                        masked_before=masked_before,
-                        contiguous_span_len=contiguous_span_len,
-                        verify_invoked=do_verify and contiguous_span_len > 0,
-                        accepted_count=accepted_count,
-                        rejection_position=rejection_pos,
-                        committed_count=committed_this_step,
-                        masked_after=masked_after,
-                        elapsed_ms=step_elapsed,
-                    ))
+                diag.last_route_score = float(route_score)
+                diag.last_block_index = int(block_idx)
+                diag.last_span_start = int(span_start)
+                diag.last_span_end = int(span_end)
 
-                # ─── Stop conditions ───
+                if store_diagnostics:
+                    diag.steps.append(
+                        S2D2StepDiag(
+                            step=total_step_counter,
+                            block_index=block_idx,
+                            block_start=blk_start,
+                            block_end=blk_end,
+                            masked_before=masked_before,
+                            contiguous_span_len=contiguous_span_len,
+                            span_start=span_start,
+                            span_end=span_end,
+                            route_score=float(route_score),
+                            verify_invoked=do_verify and contiguous_span_len > 0,
+                            verifier_mode=verifier_mode,
+                            verifier_input_tokens=verifier_input_tokens,
+                            verifier_cache_used=verifier_cache_used,
+                            accepted_count=accepted_count,
+                            rejection_position=rejection_pos,
+                            committed_count=committed_this_step,
+                            masked_after=masked_after,
+                            elapsed_ms=step_elapsed,
+                        )
+                    )
+
+                gen_out = seq[0, prompt_len:]
                 if eos_token_id is not None:
-                    gen_out = seq[0, prompt_len:]
                     eos_pos = (gen_out == eos_token_id).nonzero(as_tuple=False)
                     if eos_pos.numel() > 0:
                         eos_cut_idx = int(eos_pos[0][0].item())
                         finish_reason = "eos"
                         converged = True
+                        block_converged = True
                         break
-
                 if masked_after == 0:
                     finish_reason = "converged"
-                    converged = True
+                    block_converged = True
                     break
 
             if converged:
+                break
+            if not block_converged:
+                finish_reason = "length"
                 break
 
     elapsed = max(1e-6, time.time() - t0)
     out_ids = seq[0, prompt_len:]
     if eos_cut_idx is not None:
-        out_ids = out_ids[:max(0, eos_cut_idx + 1)]
+        out_ids = out_ids[: max(0, eos_cut_idx + 1)]
 
     tokens_generated = int((out_ids != mask_id).sum().item())
     text = _decode_text(tokenizer, out_ids, mask_id, is_dummy)
 
-    if not converged:
+    if not converged and finish_reason != "eos":
         finish_reason = "length"
 
     diag.total_denoising_steps = total_step_counter
@@ -635,8 +906,6 @@ def s2d2_decode(
     stats = {
         "engine": "s2d2",
         "mode": "S2D2",
-        "tau_mask": tau_mask,
-        "tau_edit": tau_edit,
         "block_size": block_size,
         "denoising_steps_per_block": T,
         "confidence_threshold": confidence_threshold,
@@ -652,6 +921,8 @@ def s2d2_decode(
         "verifier_skips": diag.verifier_skips,
         "avg_accepted_prefix_length": diag.avg_accepted_prefix_length,
         "fallback_to_diffusion_count": diag.fallback_to_diffusion_count,
+        "verifier_mode": verifier_mode,
+        "kv_cache_mode": diag.kv_cache_mode,
         "s2d2_diagnostics": diag.to_dict(),
     }
 
@@ -661,7 +932,6 @@ def s2d2_decode(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 def _decode_text(tok: Any, out_ids: torch.Tensor, mask_id: int, is_dummy: bool) -> str:
     text = ""
     if hasattr(tok, "decode"):

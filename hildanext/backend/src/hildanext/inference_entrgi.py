@@ -1,38 +1,22 @@
 # EntRGi: Entropy Aware Reward Guidance for Diffusion Language Models.
 # Paper: "EntRGi" (Tejaswi, Rout, Caramanis, Shakkottai, Sanghavi, 2026)
 # arXiv:2602.05000 — Algorithm 1, Section 3.1, Section 3.2.
-#
-# KEY IDEA: Modify dLLM logits at masked positions using reward gradients
-# from a frozen reward model. The reward model input at masked positions
-# is an entropy-aware interpolation between:
-#   - soft token embedding ē = Σ_j q_j E^R_j  (differentiable)
-#   - sampled hard token embedding ẽ = E^R[x]  (via STE / stop-gradient)
-#
-# The interpolation weight w = H(q) / log(K) balances:
-#   - Low entropy (confident) → trust soft embedding (continuous relaxation)
-#   - High entropy (uncertain) → trust hard embedding (STE, reward-model reliable)
-#
-# Both the dLLM and the reward model stay FROZEN. This is test-time steering.
-#
-# REWARD MODEL: Skywork-Reward-V2-Qwen3-0.6B (same Qwen3 tokenizer family)
-# The reward model is loaded separately and cached. If unavailable, the
-# engine falls back to standard confidence-based denoising.
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
 import logging
-import time
 import math as _math
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn.functional as F
 from pydantic import BaseModel, Field
 
 _log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level reward model cache
-# ---------------------------------------------------------------------------
 _REWARD_CACHE: Dict[str, Any] = {}
+_REWARD_ALIGNMENT_CACHE: Dict[str, Tuple[Optional[torch.Tensor], str]] = {}
 
 
 def load_reward_model(
@@ -40,21 +24,22 @@ def load_reward_model(
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Any, Any]:
-    """Load and cache a frozen reward model + tokenizer.
-    Returns (model, tokenizer) or (None, None) on failure.
-    """
+    """Load and cache a frozen reward model + tokenizer."""
     cache_key = f"{model_name}@{device}"
     if cache_key in _REWARD_CACHE:
         return _REWARD_CACHE[cache_key]
 
     try:
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
         _log.info("Loading reward model '%s' on %s ...", model_name, device)
         tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if dtype is None:
             dtype = torch.float16 if device.type == "cuda" else torch.float32
         mdl = AutoModelForSequenceClassification.from_pretrained(
-            model_name, torch_dtype=dtype, trust_remote_code=True,
+            model_name,
+            torch_dtype=dtype,
+            trust_remote_code=True,
         )
         mdl = mdl.to(device)
         mdl.eval()
@@ -84,9 +69,6 @@ def _get_reward_embed_weight(reward_model: Any) -> torch.Tensor:
     raise RuntimeError("Cannot extract embedding weight from reward model")
 
 
-# ---------------------------------------------------------------------------
-# Request schema
-# ---------------------------------------------------------------------------
 class InferenceEntRGiRequest(BaseModel):
     prompt: str
     mode: str = "S_MODE"
@@ -103,45 +85,34 @@ class InferenceEntRGiRequest(BaseModel):
     system_prompt: Optional[str] = None
     messages: Optional[List[Dict[str, str]]] = None
     enable_thinking: Optional[bool] = None
-    # ---- EntRGi-specific knobs (Algorithm 1 hyper-parameters) ----
     entrgi_reward_model: str = Field(
         default="Skywork/Skywork-Reward-V2-Qwen3-0.6B",
         description="HF model ID or local path for the reward model",
     )
-    entrgi_guidance_scale: float = Field(
-        default=0.5, ge=0.0, le=10.0,
-        description="η — gradient step size (paper default 0.5)",
-    )
-    entrgi_guidance_steps: int = Field(
-        default=3, ge=1, le=10,
-        description="M — reward gradient steps per denoising step (paper default 3)",
-    )
-    entrgi_temperature: float = Field(
-        default=0.7, ge=0.01, le=5.0,
-        description="τ — softmax temperature for guidance logits (paper default 0.7)",
-    )
+    entrgi_guidance_scale: float = Field(default=0.5, ge=0.0, le=10.0, description="eta")
+    entrgi_guidance_steps: int = Field(default=3, ge=1, le=10, description="M")
+    entrgi_temperature: float = Field(default=0.7, ge=0.01, le=5.0, description="tau")
     entrgi_confidence_threshold: float = Field(
-        default=0.3, ge=0.0, le=1.0,
-        description="Confidence threshold for unmasking (standard dLLM τ_mask)",
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Deprecated compatibility knob; paper-faithful decoding uses lowest-entropy selection U(q)",
     )
-    entrgi_disable_guidance: bool = Field(
-        default=False,
-        description="If True, skip reward guidance (ablation / fallback mode)",
-    )
+    entrgi_disable_guidance: bool = Field(default=False)
     entrgi_store_diagnostics: bool = Field(default=True)
 
 
-# ---------------------------------------------------------------------------
-# Diagnostics
-# ---------------------------------------------------------------------------
 @dataclass
 class EntRGiStepDiag:
     step: int
     masked_before: int
     guidance_applied: bool
     guidance_steps_run: int
+    selection_budget: int
+    selected_count: int
     avg_entropy: float
     avg_entropy_weight: float
+    avg_selected_entropy: float
     reward_before: float
     reward_after: float
     committed_count: int
@@ -157,10 +128,14 @@ class EntRGiDiagnostics:
     finish_reason: str = ""
     reward_model_name: str = ""
     reward_model_loaded: bool = False
+    reward_tokenizer_aligned: bool = False
+    tokenizer_alignment_mode: str = "unverified"
     guidance_scale: float = 0.5
     guidance_steps: int = 3
+    selection_policy_used: str = "lowest_entropy_budget"
     avg_masked_entropy: float = 0.0
     avg_entropy_weight: float = 0.0
+    avg_selected_entropy: float = 0.0
     number_of_guidance_calls: int = 0
     number_of_guided_positions: int = 0
     fallback_to_standard_count: int = 0
@@ -169,12 +144,19 @@ class EntRGiDiagnostics:
         return {
             "steps": [
                 {
-                    "step": s.step, "masked_before": s.masked_before,
+                    "step": s.step,
+                    "masked_before": s.masked_before,
                     "guidance_applied": s.guidance_applied,
                     "guidance_steps_run": s.guidance_steps_run,
-                    "avg_entropy": s.avg_entropy, "avg_entropy_weight": s.avg_entropy_weight,
-                    "reward_before": s.reward_before, "reward_after": s.reward_after,
-                    "committed_count": s.committed_count, "masked_after": s.masked_after,
+                    "selection_budget": s.selection_budget,
+                    "selected_count": s.selected_count,
+                    "avg_entropy": s.avg_entropy,
+                    "avg_entropy_weight": s.avg_entropy_weight,
+                    "avg_selected_entropy": s.avg_selected_entropy,
+                    "reward_before": s.reward_before,
+                    "reward_after": s.reward_after,
+                    "committed_count": s.committed_count,
+                    "masked_after": s.masked_after,
                     "elapsed_ms": s.elapsed_ms,
                 }
                 for s in self.steps
@@ -184,29 +166,191 @@ class EntRGiDiagnostics:
             "finish_reason": self.finish_reason,
             "reward_model_name": self.reward_model_name,
             "reward_model_loaded": self.reward_model_loaded,
+            "reward_tokenizer_aligned": self.reward_tokenizer_aligned,
+            "tokenizer_alignment_mode": self.tokenizer_alignment_mode,
             "guidance_scale": self.guidance_scale,
             "guidance_steps": self.guidance_steps,
+            "selection_policy_used": self.selection_policy_used,
             "avg_masked_entropy": self.avg_masked_entropy,
             "avg_entropy_weight": self.avg_entropy_weight,
+            "avg_selected_entropy": self.avg_selected_entropy,
             "number_of_guidance_calls": self.number_of_guidance_calls,
             "number_of_guided_positions": self.number_of_guided_positions,
             "fallback_to_standard_count": self.fallback_to_standard_count,
         }
 
 
-# ---------------------------------------------------------------------------
-# Core EntRGi helpers — paper-faithful math
-# ---------------------------------------------------------------------------
+def _safe_tokenizer_vocab_size(tokenizer: Any) -> int:
+    vals = [
+        int(getattr(tokenizer, "vocab_size", 0) or 0),
+        int(len(tokenizer)) if hasattr(tokenizer, "__len__") else 0,
+    ]
+    return max(vals) if vals else 0
+
+
+def _tokenizer_name(tokenizer: Any) -> str:
+    for attr in ("name_or_path", "_name_or_path"):
+        value = getattr(tokenizer, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return tokenizer.__class__.__name__
+
+
+def _id_to_token(tokenizer: Any, token_id: int) -> Optional[str]:
+    if hasattr(tokenizer, "convert_ids_to_tokens"):
+        try:
+            tok = tokenizer.convert_ids_to_tokens(int(token_id))
+            if isinstance(tok, list):
+                tok = tok[0] if tok else None
+            if isinstance(tok, str):
+                return tok
+        except Exception:
+            pass
+    if hasattr(tokenizer, "decode"):
+        try:
+            tok = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+            return tok if isinstance(tok, str) and tok != "" else None
+        except Exception:
+            pass
+    if hasattr(tokenizer, "get_vocab"):
+        try:
+            vocab = tokenizer.get_vocab()
+            if isinstance(vocab, dict):
+                for tok, idx in vocab.items():
+                    if int(idx) == int(token_id):
+                        return str(tok)
+        except Exception:
+            pass
+    return None
+
+
+def _token_to_id(tokenizer: Any, token: str) -> Optional[int]:
+    if hasattr(tokenizer, "convert_tokens_to_ids"):
+        try:
+            idx = tokenizer.convert_tokens_to_ids(token)
+            if isinstance(idx, int):
+                return int(idx)
+        except Exception:
+            pass
+    if hasattr(tokenizer, "get_vocab"):
+        try:
+            vocab = tokenizer.get_vocab()
+            if isinstance(vocab, dict) and token in vocab:
+                return int(vocab[token])
+        except Exception:
+            pass
+    return None
+
+
+def build_reward_id_map(
+    tokenizer: Any,
+    reward_tokenizer: Any,
+    model_vocab_size: int,
+    reward_vocab_size: int,
+) -> Tuple[Optional[torch.Tensor], str]:
+    """Build a base-token-id -> reward-token-id map over the model vocabulary."""
+    if model_vocab_size <= 0 or reward_vocab_size <= 0:
+        return None, "invalid_vocab_size"
+    if tokenizer is reward_tokenizer and reward_vocab_size >= model_vocab_size:
+        return torch.arange(model_vocab_size, dtype=torch.long), "identity"
+
+    try:
+        base_vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else None
+        reward_vocab = reward_tokenizer.get_vocab() if hasattr(reward_tokenizer, "get_vocab") else None
+        if isinstance(base_vocab, dict) and isinstance(reward_vocab, dict) and base_vocab == reward_vocab and reward_vocab_size >= model_vocab_size:
+            return torch.arange(model_vocab_size, dtype=torch.long), "shared_vocab_dict"
+    except Exception:
+        pass
+
+    base_tok_vocab = _safe_tokenizer_vocab_size(tokenizer)
+    reward_tok_vocab = _safe_tokenizer_vocab_size(reward_tokenizer)
+    if base_tok_vocab < model_vocab_size:
+        return None, "base_vocab_too_small"
+    if reward_tok_vocab <= 0:
+        return None, "reward_vocab_unavailable"
+
+    cache_key = f"{id(tokenizer)}:{id(reward_tokenizer)}:{model_vocab_size}:{reward_vocab_size}"
+    cached = _REWARD_ALIGNMENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    mapping = torch.full((model_vocab_size,), -1, dtype=torch.long)
+    for token_id in range(model_vocab_size):
+        tok = _id_to_token(tokenizer, token_id)
+        if tok is None:
+            result = (None, "base_token_decode_failed")
+            _REWARD_ALIGNMENT_CACHE[cache_key] = result
+            return result
+        reward_id = _token_to_id(reward_tokenizer, tok)
+        if reward_id is None or reward_id < 0 or reward_id >= reward_vocab_size:
+            result = (None, "reward_token_missing")
+            _REWARD_ALIGNMENT_CACHE[cache_key] = result
+            return result
+        reward_tok = _id_to_token(reward_tokenizer, reward_id)
+        if reward_tok != tok:
+            result = (None, "token_roundtrip_mismatch")
+            _REWARD_ALIGNMENT_CACHE[cache_key] = result
+            return result
+        mapping[token_id] = int(reward_id)
+
+    result = (mapping, "token_string_map")
+    _REWARD_ALIGNMENT_CACHE[cache_key] = result
+    return result
+
+
+def _prepare_reward_guidance_view(
+    tokenizer: Any,
+    reward_tokenizer: Any,
+    reward_embed_weight: torch.Tensor,
+    model_vocab_size: int,
+    mask_id: int,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    reward_vocab_size = int(reward_embed_weight.shape[0])
+    reward_id_map, mode = build_reward_id_map(tokenizer, reward_tokenizer, model_vocab_size, reward_vocab_size)
+    if reward_id_map is None:
+        return None, mode
+
+    actual_token_ids_cpu = torch.arange(model_vocab_size, dtype=torch.long)
+    actual_token_ids_cpu = actual_token_ids_cpu[actual_token_ids_cpu.ne(int(mask_id))]
+    if actual_token_ids_cpu.numel() == 0:
+        return None, "no_actual_tokens"
+
+    reward_actual_ids = reward_id_map.index_select(0, actual_token_ids_cpu)
+    if bool((reward_actual_ids < 0).any()):
+        return None, "actual_token_mapping_incomplete"
+
+    aligned_reward_embeds = reward_embed_weight.index_select(0, reward_actual_ids.to(reward_embed_weight.device))
+    return {
+        "reward_id_map_cpu": reward_id_map,
+        "actual_token_ids_cpu": actual_token_ids_cpu,
+        "reward_actual_ids_cpu": reward_actual_ids,
+        "aligned_reward_embeds": aligned_reward_embeds,
+    }, mode
+
 
 def compute_entropy_weights(q: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    """Algorithm 1 line 9: w^l = Entropy(q^l) / log K.
-    q: (N, V) valid probability distribution.
-    Returns: (N,) weights in [0, 1].
-    """
+    """Algorithm 1 line 9: w = H(q) / log K."""
     log_q = q.clamp(min=1e-12).log()
-    entropy = -(q * log_q).sum(dim=-1)  # (N,)
-    w = (entropy / _math.log(max(vocab_size, 2))).clamp(0.0, 1.0)
-    return w
+    entropy = -(q * log_q).sum(dim=-1)
+    return (entropy / _math.log(max(vocab_size, 2))).clamp(0.0, 1.0)
+
+
+def select_lowest_entropy_mask_positions(
+    masked_q: torch.Tensor,
+    remaining_steps: int,
+) -> Tuple[torch.Tensor, int, float, float]:
+    """Dream-like U(q): choose a budgeted subset of currently masked positions with lowest entropy."""
+    num_masked = int(masked_q.shape[0])
+    if num_masked == 0:
+        return torch.zeros((0,), dtype=torch.long, device=masked_q.device), 0, 0.0, 0.0
+
+    probs = masked_q.clamp(min=1e-12)
+    entropies = -(probs * probs.log()).sum(dim=-1)
+    budget = min(num_masked, max(1, int(_math.ceil(num_masked / max(1, remaining_steps)))))
+    chosen = torch.topk(entropies, k=budget, largest=False).indices
+    avg_entropy = float(entropies.mean().item())
+    avg_selected_entropy = float(entropies[chosen].mean().item()) if chosen.numel() > 0 else 0.0
+    return chosen, budget, avg_entropy, avg_selected_entropy
 
 
 def apply_entrgi_guidance(
@@ -216,50 +360,43 @@ def apply_entrgi_guidance(
     mask_id: int,
     prompt_len: int,
     reward_model: Any,
-    reward_embed_weight: torch.Tensor,
+    reward_view: Dict[str, Any],
     guidance_scale: float,
     guidance_steps: int,
     temperature: float,
     device: torch.device,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Apply M steps of EntRGi gradient guidance to logits at masked positions.
+    """Apply M steps of EntRGi gradient guidance to masked-position logits."""
+    S = int(seq.shape[1])
+    V_logits = int(logits.shape[-1])
+    actual_token_ids_cpu = reward_view["actual_token_ids_cpu"]
+    reward_actual_ids_cpu = reward_view["reward_actual_ids_cpu"]
+    valid_vocab = actual_token_ids_cpu.lt(V_logits)
+    actual_token_ids = actual_token_ids_cpu[valid_vocab].to(device=device)
+    reward_actual_ids = reward_actual_ids_cpu[valid_vocab].to(device=device)
+    aligned_reward_embeds = _get_reward_embed_weight(reward_model).to(device=device).index_select(0, reward_actual_ids).to(dtype=logits.dtype)
 
-    Implements Algorithm 1, lines 5-12.
-    Both the dLLM and the reward model are frozen.
-    Gradients flow: R(ê) → ê → ē (soft embed) → q (softmax) → ψ (logits).
-
-    Returns: (guided_logits, info_dict)
-    """
-    S = seq.shape[1]
-    V_reward, D = reward_embed_weight.shape
-    V_logits = logits.shape[-1]
-    V_common = min(V_logits, V_reward)
-
-    # Find masked positions
     gen_is_mask = seq[0, prompt_len:].eq(mask_id)
     masked_gen_idx = gen_is_mask.nonzero(as_tuple=False).view(-1)
-    num_masked = masked_gen_idx.shape[0]
-
+    num_masked = int(masked_gen_idx.shape[0])
     info: Dict[str, float] = {
-        "avg_entropy": 0.0, "avg_w": 0.0,
-        "reward_before": 0.0, "reward_after": 0.0,
+        "avg_entropy": 0.0,
+        "avg_w": 0.0,
+        "reward_before": 0.0,
+        "reward_after": 0.0,
         "num_guided": float(num_masked),
     }
-
-    if num_masked == 0:
+    if num_masked == 0 or actual_token_ids.numel() == 0:
         return logits, info
 
-    masked_seq_idx = masked_gen_idx + prompt_len  # in full-seq coords
+    masked_seq_idx = masked_gen_idx + prompt_len
+    psi = logits[0, masked_seq_idx, :].index_select(-1, actual_token_ids).detach().clone().requires_grad_(True)
 
-    # Extract logits at masked positions (only over shared vocabulary)
-    psi = logits[0, masked_seq_idx, :V_common].detach().clone().requires_grad_(True)
-
-    # Prepare base embeddings for non-masked positions (detached)
-    seq_for_embed = seq[0].clone()
-    seq_for_embed[seq_for_embed >= V_reward] = 0  # clip out-of-vocab (mask token)
-    base_embeds = F.embedding(seq_for_embed, reward_embed_weight).detach()  # (S, D)
-
-    # Attention mask: all ones (all positions attend)
+    reward_id_map_cpu = reward_view["reward_id_map_cpu"]
+    reward_seq_ids = reward_id_map_cpu.index_select(0, seq[0].detach().cpu().long()).to(device=device)
+    if bool((reward_seq_ids < 0).any()):
+        raise RuntimeError("Reward tokenizer alignment missing for committed sequence tokens")
+    base_embeds = F.embedding(reward_seq_ids, _get_reward_embed_weight(reward_model).to(device=device)).detach()
     attn_mask = torch.ones(1, S, dtype=torch.long, device=device)
 
     reward_before = 0.0
@@ -271,81 +408,59 @@ def apply_entrgi_guidance(
         if psi.grad is not None:
             psi.grad.zero_()
 
-        # Alg 1, line 6: q = softmax(ψ/τ)
-        q = F.softmax(psi / temperature, dim=-1)  # (num_masked, V_common)
+        q = F.softmax(psi / temperature, dim=-1)
+        e_bar = torch.matmul(q, aligned_reward_embeds.to(q.dtype))
 
-        # Alg 1, line 8: soft embedding ē = Σ q_i E^R_i  (differentiable)
-        e_bar = torch.matmul(q, reward_embed_weight[:V_common].to(q.dtype))  # (num_masked, D)
-
-        # Alg 1, line 7: sample hard token, get embedding ẽ
         with torch.no_grad():
-            sampled_ids = torch.multinomial(q.detach(), 1).squeeze(-1)
-            e_tilde = reward_embed_weight[sampled_ids].to(q.dtype)  # (num_masked, D)
-
-        # Alg 1, line 9: entropy weight w = H(q) / log K
-        with torch.no_grad():
-            w = compute_entropy_weights(q.detach(), V_common)  # (num_masked,)
-            all_entropies.append(float(-(q.detach().clamp(1e-12) * q.detach().clamp(1e-12).log()).sum(-1).mean().item()))
+            sampled_local = torch.multinomial(q.detach(), 1).squeeze(-1)
+            e_tilde = aligned_reward_embeds.index_select(0, sampled_local).to(q.dtype)
+            w = compute_entropy_weights(q.detach(), int(actual_token_ids.numel()))
+            entropy = -(q.detach().clamp(min=1e-12) * q.detach().clamp(min=1e-12).log()).sum(dim=-1)
+            all_entropies.append(float(entropy.mean().item()))
             all_weights.append(float(w.mean().item()))
-
-        # Alg 1, line 10: ê = ē + sg(w(ẽ - ē))
-        # stop-gradient on the shift so gradients flow only through ē
-        with torch.no_grad():
             shift = w.unsqueeze(-1) * (e_tilde - e_bar.detach())
-        mixed = e_bar + shift.detach()  # (num_masked, D) — grad through e_bar
 
-        # Build full reward-model input (differentiable at masked positions)
-        # Use matmul with one-hot scatter for differentiable placement
-        if num_masked < S:
-            idx_mat = torch.zeros(num_masked, S, device=device, dtype=mixed.dtype)
-            idx_mat[torch.arange(num_masked, device=device), masked_seq_idx] = 1.0
-            scattered = idx_mat.T @ mixed  # (S, D) — differentiable
+        mixed = e_bar + shift.detach()
+        idx_mat = torch.zeros(num_masked, S, device=device, dtype=mixed.dtype)
+        idx_mat[torch.arange(num_masked, device=device), masked_seq_idx] = 1.0
+        scattered = idx_mat.T @ mixed
+        mask_indicator = torch.zeros(S, 1, device=device, dtype=mixed.dtype)
+        mask_indicator[masked_seq_idx] = 1.0
+        full_embeds = ((1.0 - mask_indicator) * base_embeds.to(mixed.dtype) + mask_indicator * scattered).unsqueeze(0)
 
-            mask_indicator = torch.zeros(S, 1, device=device, dtype=mixed.dtype)
-            mask_indicator[masked_seq_idx] = 1.0
-
-            full_embeds = ((1.0 - mask_indicator) * base_embeds.to(mixed.dtype)
-                           + mask_indicator * scattered).unsqueeze(0)
-        else:
-            # All positions masked (rare edge case)
-            full_embeds = mixed.unsqueeze(0)
-
-        # Forward through frozen reward model
-        try:
-            r_out = reward_model(inputs_embeds=full_embeds, attention_mask=attn_mask)
-            reward = r_out.logits.squeeze()
-        except Exception:
-            # Reward model failed — skip this guidance step
-            break
-
+        reward = reward_model(inputs_embeds=full_embeds, attention_mask=attn_mask).logits.squeeze()
         if j == 0:
             reward_before = float(reward.item())
-
-        # Alg 1, line 11: ψ ← ψ + η ∇ψ R(ê)
         reward.backward()
 
         if psi.grad is not None:
             with torch.no_grad():
-                psi.data.add_(guidance_scale * psi.grad)
+                psi.add_(guidance_scale * psi.grad)
+                updated_q = F.softmax(psi / temperature, dim=-1)
+                updated_e_bar = torch.matmul(updated_q, aligned_reward_embeds.to(updated_q.dtype))
+                updated_sampled = torch.multinomial(updated_q.detach(), 1).squeeze(-1)
+                updated_e_tilde = aligned_reward_embeds.index_select(0, updated_sampled).to(updated_q.dtype)
+                updated_w = compute_entropy_weights(updated_q.detach(), int(actual_token_ids.numel()))
+                updated_shift = updated_w.unsqueeze(-1) * (updated_e_tilde - updated_e_bar.detach())
+                updated_mixed = updated_e_bar + updated_shift.detach()
+                updated_scattered = idx_mat.T @ updated_mixed
+                updated_full_embeds = ((1.0 - mask_indicator) * base_embeds.to(updated_mixed.dtype) + mask_indicator * updated_scattered).unsqueeze(0)
+                reward_after = float(
+                    reward_model(inputs_embeds=updated_full_embeds, attention_mask=attn_mask).logits.squeeze().item()
+                )
 
-        reward_after = float(reward.item())
-
-    # Aggregate diagnostics
     info["avg_entropy"] = sum(all_entropies) / max(len(all_entropies), 1)
     info["avg_w"] = sum(all_weights) / max(len(all_weights), 1)
     info["reward_before"] = reward_before
     info["reward_after"] = reward_after
 
-    # Write guided logits back
     result = logits.clone()
     with torch.no_grad():
-        result[0, masked_seq_idx, :V_common] = psi.detach()
+        result[0, masked_seq_idx, :].index_copy_(1, actual_token_ids, psi.detach())
+        if 0 <= int(mask_id) < V_logits:
+            result[0, masked_seq_idx, int(mask_id)] = torch.finfo(result.dtype).min
     return result, info
 
-
-# ---------------------------------------------------------------------------
-# Main EntRGi decode loop
-# ---------------------------------------------------------------------------
 
 def entrgi_decode(
     *,
@@ -370,11 +485,10 @@ def entrgi_decode(
     is_dummy: bool = False,
     force_noncausal_ctx: Any = None,
 ) -> Tuple[str, Dict[str, Any], EntRGiDiagnostics]:
-    """Full EntRGi inference loop (Algorithm 1).
-    The dLLM and reward model both remain frozen.
-    Returns: (text, stats_dict, diagnostics).
-    """
+    """Full EntRGi inference loop implementing Algorithm 1."""
     from .utils import seed_everything, tokens_per_second
+
+    del tau_mask, tau_edit, confidence_threshold
 
     seed_everything(seed)
     diag = EntRGiDiagnostics(
@@ -383,26 +497,43 @@ def entrgi_decode(
         guidance_steps=guidance_steps,
     )
 
-    # Load reward model (cached, lazy)
     reward_model = None
-    reward_embed_weight = None
+    reward_view = None
     if not is_dummy and not disable_guidance:
-        rm, _rm_tok = load_reward_model(reward_model_name, device)
-        if rm is not None:
-            reward_model = rm
+        rm, reward_tokenizer = load_reward_model(reward_model_name, device)
+        if rm is not None and reward_tokenizer is not None:
             try:
                 reward_embed_weight = _get_reward_embed_weight(rm)
+                reward_view, alignment_mode = _prepare_reward_guidance_view(
+                    tokenizer=tokenizer,
+                    reward_tokenizer=reward_tokenizer,
+                    reward_embed_weight=reward_embed_weight,
+                    model_vocab_size=int(vocab_size),
+                    mask_id=int(mask_id),
+                )
                 diag.reward_model_loaded = True
+                diag.tokenizer_alignment_mode = alignment_mode
+                diag.reward_tokenizer_aligned = reward_view is not None
+                if reward_view is not None:
+                    reward_model = rm
+                else:
+                    _log.warning(
+                        "Disabling EntRGi guidance because tokenizer alignment failed: base=%s reward=%s mode=%s",
+                        _tokenizer_name(tokenizer),
+                        _tokenizer_name(reward_tokenizer),
+                        alignment_mode,
+                    )
             except Exception as exc:
-                _log.warning("Could not extract reward embeddings: %s", exc)
-                reward_model = None
+                _log.warning("Could not prepare reward guidance view: %s", exc)
+                diag.tokenizer_alignment_mode = "alignment_exception"
+        else:
+            diag.tokenizer_alignment_mode = "reward_model_unavailable"
+    else:
+        diag.tokenizer_alignment_mode = "guidance_disabled"
 
-    # Encode prompt
     enc = tokenizer([prompt], return_tensors="pt")
     input_ids = enc["input_ids"].to(device)
     prompt_len = int(input_ids.shape[1])
-
-    # Build sequence: [prompt] [MASK × max_new_tokens]
     seq = torch.full((1, prompt_len + max_new_tokens), mask_id, dtype=torch.long, device=device)
     seq[:, :prompt_len] = input_ids
 
@@ -420,6 +551,7 @@ def entrgi_decode(
 
     all_entropies: List[float] = []
     all_weights: List[float] = []
+    all_selected_entropies: List[float] = []
 
     for step in range(max_steps):
         step_t0 = time.time()
@@ -432,23 +564,22 @@ def entrgi_decode(
             converged = True
             break
 
-        # ── STEP 1: dLLM forward (frozen, no grad) ──
         with torch.no_grad():
             if force_noncausal_ctx is not None:
                 with force_noncausal_ctx(model):
                     draft_out = model(input_ids=seq)
             else:
                 draft_out = model(input_ids=seq)
-        logits = draft_out.logits.detach().clone()  # (1, S, V)
+        logits = draft_out.logits.detach().clone()
 
-        # ── STEP 2: EntRGi reward guidance (Algorithm 1 lines 5-12) ──
         guidance_applied = False
         step_info: Dict[str, float] = {
-            "avg_entropy": 0.0, "avg_w": 0.0,
-            "reward_before": 0.0, "reward_after": 0.0,
+            "avg_entropy": 0.0,
+            "avg_w": 0.0,
+            "reward_before": 0.0,
+            "reward_after": 0.0,
         }
-
-        if reward_model is not None and masked_before > 0:
+        if reward_model is not None and reward_view is not None:
             try:
                 logits, step_info = apply_entrgi_guidance(
                     logits=logits,
@@ -456,7 +587,7 @@ def entrgi_decode(
                     mask_id=mask_id,
                     prompt_len=prompt_len,
                     reward_model=reward_model,
-                    reward_embed_weight=reward_embed_weight,
+                    reward_view=reward_view,
                     guidance_scale=guidance_scale,
                     guidance_steps=guidance_steps,
                     temperature=entrgi_temperature,
@@ -473,46 +604,50 @@ def entrgi_decode(
         else:
             diag.fallback_to_standard_count += 1
 
-        # ── STEP 3: Standard unmasking with (guided) logits (Alg 1 lines 13-15) ──
         with torch.no_grad():
-            gen_logits = logits[:, prompt_len:, :]
-            gen_probs = F.softmax(gen_logits.float(), dim=-1)
-            confidence, pred_ids = gen_probs.max(dim=-1)  # (1, gen_len)
+            masked_gen_idx = gen_is_mask.nonzero(as_tuple=False).view(-1)
+            masked_seq_idx = masked_gen_idx + prompt_len
+            actual_token_ids = torch.arange(logits.shape[-1], device=device, dtype=torch.long)
+            actual_token_ids = actual_token_ids[actual_token_ids.ne(int(mask_id))]
+            masked_logits = logits[0, masked_seq_idx, :].index_select(-1, actual_token_ids)
+            masked_q = F.softmax(masked_logits.float() / entrgi_temperature, dim=-1)
+            remaining_steps = max(1, max_steps - step)
+            chosen_local, selection_budget, avg_masked_entropy, avg_selected_entropy = select_lowest_entropy_mask_positions(
+                masked_q,
+                remaining_steps,
+            )
+            all_selected_entropies.append(avg_selected_entropy)
 
-            # Select positions to unmask: masked & confident enough
-            selected = gen_is_mask & confidence[0].ge(confidence_threshold)
-            # Always unmask at least one position per step
-            if gen_is_mask.any() and not selected.any():
-                best = confidence[0].clone()
-                best[~gen_is_mask] = -float("inf")
-                best_pos = int(best.argmax().item())
-                selected[best_pos] = True
-
-            # Commit tokens
-            if selected.any():
-                gen_region[selected] = pred_ids[0][selected]
-                seq[0, prompt_len:] = gen_region
+            sampled_local = torch.multinomial(masked_q.index_select(0, chosen_local), 1).squeeze(-1)
+            sampled_token_ids = actual_token_ids.index_select(0, sampled_local)
+            selected_positions = masked_gen_idx.index_select(0, chosen_local)
+            gen_region[selected_positions] = sampled_token_ids
+            seq[0, prompt_len:] = gen_region
 
         masked_after = int(seq[0, prompt_len:].eq(mask_id).sum().item())
         committed = masked_before - masked_after
         step_elapsed = (time.time() - step_t0) * 1000.0
 
         if store_diagnostics:
-            diag.steps.append(EntRGiStepDiag(
-                step=step + 1,
-                masked_before=masked_before,
-                guidance_applied=guidance_applied,
-                guidance_steps_run=guidance_steps if guidance_applied else 0,
-                avg_entropy=step_info.get("avg_entropy", 0.0),
-                avg_entropy_weight=step_info.get("avg_w", 0.0),
-                reward_before=step_info.get("reward_before", 0.0),
-                reward_after=step_info.get("reward_after", 0.0),
-                committed_count=committed,
-                masked_after=masked_after,
-                elapsed_ms=step_elapsed,
-            ))
+            diag.steps.append(
+                EntRGiStepDiag(
+                    step=step + 1,
+                    masked_before=masked_before,
+                    guidance_applied=guidance_applied,
+                    guidance_steps_run=guidance_steps if guidance_applied else 0,
+                    selection_budget=selection_budget,
+                    selected_count=int(chosen_local.numel()),
+                    avg_entropy=step_info.get("avg_entropy", avg_masked_entropy),
+                    avg_entropy_weight=step_info.get("avg_w", 0.0),
+                    avg_selected_entropy=avg_selected_entropy,
+                    reward_before=step_info.get("reward_before", 0.0),
+                    reward_after=step_info.get("reward_after", 0.0),
+                    committed_count=committed,
+                    masked_after=masked_after,
+                    elapsed_ms=step_elapsed,
+                )
+            )
 
-        # Stop conditions
         if eos_token_id is not None:
             eos_pos = (seq[0, prompt_len:] == eos_token_id).nonzero(as_tuple=False)
             if eos_pos.numel() > 0:
@@ -529,7 +664,7 @@ def entrgi_decode(
     elapsed = max(1e-6, time.time() - t0)
     out_ids = seq[0, prompt_len:]
     if eos_cut_idx is not None:
-        out_ids = out_ids[:max(0, eos_cut_idx + 1)]
+        out_ids = out_ids[: max(0, eos_cut_idx + 1)]
 
     tokens_generated = int((out_ids != mask_id).sum().item())
     text = _decode_text(tokenizer, out_ids, mask_id, is_dummy)
@@ -544,12 +679,12 @@ def entrgi_decode(
         diag.avg_masked_entropy = sum(all_entropies) / len(all_entropies)
     if all_weights:
         diag.avg_entropy_weight = sum(all_weights) / len(all_weights)
+    if all_selected_entropies:
+        diag.avg_selected_entropy = sum(all_selected_entropies) / len(all_selected_entropies)
 
     stats = {
         "engine": "entrgi",
         "mode": "EntRGi",
-        "tau_mask": tau_mask,
-        "tau_edit": tau_edit,
         "steps": diag.total_denoising_steps,
         "tokens_generated": tokens_generated,
         "tokens_per_sec": tokens_per_second(tokens_generated, elapsed),
@@ -560,19 +695,19 @@ def entrgi_decode(
         "guidance_steps": guidance_steps,
         "reward_model_name": reward_model_name,
         "reward_model_loaded": diag.reward_model_loaded,
+        "reward_tokenizer_aligned": diag.reward_tokenizer_aligned,
+        "tokenizer_alignment_mode": diag.tokenizer_alignment_mode,
+        "selection_policy_used": diag.selection_policy_used,
         "number_of_guidance_calls": diag.number_of_guidance_calls,
         "avg_masked_entropy": diag.avg_masked_entropy,
         "avg_entropy_weight": diag.avg_entropy_weight,
+        "avg_selected_entropy": diag.avg_selected_entropy,
         "fallback_to_standard_count": diag.fallback_to_standard_count,
         "entrgi_diagnostics": diag.to_dict(),
     }
 
     return text.strip(), stats, diag
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _decode_text(tok: Any, out_ids: torch.Tensor, mask_id: int, is_dummy: bool) -> str:
     text = ""

@@ -9,11 +9,14 @@ from hildanext.utils import TinyCausalLM, SimpleTokenizer
 from hildanext.inference_s2d2 import (
     InferenceS2D2Request,
     S2D2Diagnostics,
+    S2D2VerifierInputs,
+    detect_s2d2_verifier_mode,
     find_first_contiguous_mask_span,
     estimate_expected_accept_prefix,
     compute_verification_score,
     route_s2d2_verification,
     build_verifier_inputs_position_aligned,
+    build_block_draft_attention_mask,
     run_s2d2_verification,
     s2d2_decode,
 )
@@ -259,26 +262,29 @@ class TestVerifierReusesSameModel(unittest.TestCase):
         seq = torch.full((1, 10), MASK_ID, dtype=torch.long)
         seq[0, :3] = torch.tensor([1, 2, 3])  # prompt
         drafted_ids = torch.tensor([5, 6, 7])
-        ver_seq = build_verifier_inputs_position_aligned(drafted_ids, MASK_ID, 3, 6, seq)
-        # Verify drafted tokens are placed correctly
-        self.assertTrue(torch.equal(ver_seq[0, 3:6], drafted_ids))
-        # Verify prompt is preserved
-        self.assertTrue(torch.equal(ver_seq[0, :3], seq[0, :3]))
+        ver_inputs = build_verifier_inputs_position_aligned(drafted_ids, MASK_ID, 3, 6, seq)
+        self.assertEqual(ver_inputs.verifier_mode, "position_aligned_2l")
+        self.assertTrue(torch.equal(ver_inputs.input_ids[0, :3], seq[0, :3]))
+        self.assertTrue(torch.equal(ver_inputs.input_ids[0, 3:6], drafted_ids))
+        self.assertTrue(torch.equal(ver_inputs.input_ids[0, 6:9], torch.tensor([MASK_ID, MASK_ID, MASK_ID])))
+        self.assertEqual(tuple(ver_inputs.position_ids[0, 3:9].tolist()), (3, 4, 5, 3, 4, 5))
 
     def test_verification_produces_results(self):
         model = _make_dummy_model()
         seq = torch.full((1, 10), MASK_ID, dtype=torch.long)
         seq[0, :3] = torch.tensor([1, 2, 3])
         drafted_ids = torch.tensor([5, 6, 7])
-        ver_seq = build_verifier_inputs_position_aligned(drafted_ids, MASK_ID, 3, 6, seq)
+        ver_inputs = build_verifier_inputs_position_aligned(drafted_ids, MASK_ID, 3, 6, seq)
         # Make dummy draft probs
         draft_probs = torch.ones(1, 10, VOCAB) / VOCAB
-        accepted_ids, ver_logits, acc_count, rej_pos = run_s2d2_verification(
-            model=model, verifier_seq=ver_seq, draft_probs=draft_probs,
+        accepted_ids, ver_logits, acc_count, rej_pos, cache_used = run_s2d2_verification(
+            model=model, verifier_inputs=ver_inputs, draft_probs=draft_probs,
             drafted_ids=drafted_ids, span_start=3, span_end=6,
         )
         self.assertEqual(accepted_ids.shape[0], 3)
+        self.assertEqual(ver_logits.shape[0], 3)
         self.assertGreaterEqual(acc_count, 0)
+        self.assertFalse(cache_used)
 
 
 # ---------------------------------------------------------------------------
@@ -292,12 +298,12 @@ class TestAcceptanceLeftToRight(unittest.TestCase):
         seq = torch.full((1, 8), MASK_ID, dtype=torch.long)
         seq[0, :2] = torch.tensor([1, 2])
         drafted_ids = torch.tensor([5, 6, 7, 8])
-        ver_seq = build_verifier_inputs_position_aligned(drafted_ids, MASK_ID, 2, 6, seq)
+        ver_inputs = build_verifier_inputs_position_aligned(drafted_ids, MASK_ID, 2, 6, seq)
         # Make draft probs strongly peaked at wrong tokens so verifier likely rejects
         draft_probs = torch.zeros(1, 8, VOCAB)
         draft_probs[0, :, 10] = 1.0  # peaked at token 10, but drafted token is 5,6,7,8
-        _, _, acc_count, rej_pos = run_s2d2_verification(
-            model=model, verifier_seq=ver_seq, draft_probs=draft_probs,
+        _, _, acc_count, rej_pos, _ = run_s2d2_verification(
+            model=model, verifier_inputs=ver_inputs, draft_probs=draft_probs,
             drafted_ids=drafted_ids, span_start=2, span_end=6,
         )
         # Either all accepted or rejection happened somewhere
@@ -390,13 +396,20 @@ class TestS2D2EndToEnd(unittest.TestCase):
         self.assertIn("accepted_prefix_lengths", d)
         self.assertIn("routing_policy_used", d)
         self.assertIn("verifier_mask_path", d)
-        self.assertEqual(d["verifier_mask_path"], "position_aligned_2n")
+        self.assertEqual(d["verifier_mode_used"], "position_aligned_2l")
         self.assertIsInstance(d["steps"], list)
         if d["steps"]:
             step = d["steps"][0]
+            self.assertIn("block_index", step)
+            self.assertIn("route_score", step)
             self.assertIn("verify_invoked", step)
             self.assertIn("accepted_count", step)
             self.assertIn("rejection_position", step)
+
+    def test_detect_verifier_mode_defaults_to_position_aligned(self):
+        model = _make_dummy_model()
+        tok = _make_dummy_tokenizer()
+        self.assertEqual(detect_s2d2_verifier_mode(model, tok), "position_aligned_2l")
 
     def test_not_equivalent_to_global_ar(self):
         """Paper Section 4.4: S2D2 is NOT global AR. Verify hybrid trajectory."""
@@ -423,6 +436,112 @@ class TestS2D2EndToEnd(unittest.TestCase):
         self.assertGreater(diag_always.verifier_invocations, 0)
         self.assertEqual(diag_never.verifier_invocations, 0)
         self.assertGreater(diag_never.fallback_to_diffusion_count, 0)
+
+
+# ---------------------------------------------------------------------------
+# 11. Block draft attention mask
+# ---------------------------------------------------------------------------
+class TestBlockDraftAttentionMask(unittest.TestCase):
+    """Paper Section 4.2, Eq.(4) simplified: causal prefix + fully-visible block."""
+
+    def test_shape(self):
+        mask = build_block_draft_attention_mask(seq_len=10, block_start=4, block_end=8, device=torch.device("cpu"))
+        self.assertEqual(mask.shape, (1, 10, 10))
+
+    def test_prefix_causal(self):
+        mask = build_block_draft_attention_mask(seq_len=8, block_start=4, block_end=8, device=torch.device("cpu"))
+        m = mask[0]
+        # Prefix region [0:4, 0:4] should be lower-triangular (causal)
+        for i in range(4):
+            for j in range(4):
+                if j <= i:
+                    self.assertTrue(bool(m[i, j]), f"prefix causal: m[{i},{j}] should be True")
+                else:
+                    self.assertFalse(bool(m[i, j]), f"prefix causal: m[{i},{j}] should be False")
+
+    def test_block_sees_prefix(self):
+        mask = build_block_draft_attention_mask(seq_len=8, block_start=4, block_end=8, device=torch.device("cpu"))
+        m = mask[0]
+        # Block rows [4:8] should see all of prefix [0:4]
+        for i in range(4, 8):
+            for j in range(4):
+                self.assertTrue(bool(m[i, j]), f"block→prefix: m[{i},{j}] should be True")
+
+    def test_block_fully_visible(self):
+        mask = build_block_draft_attention_mask(seq_len=8, block_start=4, block_end=8, device=torch.device("cpu"))
+        m = mask[0]
+        # Block [4:8, 4:8] should be all True (fully visible)
+        for i in range(4, 8):
+            for j in range(4, 8):
+                self.assertTrue(bool(m[i, j]), f"block self: m[{i},{j}] should be True")
+
+    def test_no_prefix(self):
+        mask = build_block_draft_attention_mask(seq_len=4, block_start=0, block_end=4, device=torch.device("cpu"))
+        m = mask[0]
+        # Entire 4×4 should be True (no prefix, block is fully visible)
+        self.assertTrue(m[:4, :4].all())
+
+
+# ---------------------------------------------------------------------------
+# 12. Verifier mask path typo fix check
+# ---------------------------------------------------------------------------
+class TestVerifierMaskPathNoTypo(unittest.TestCase):
+    """Ensure verifier_mask_path is '2l' not '2n' (medium fix)."""
+
+    def test_diagnostics_default(self):
+        diag = S2D2Diagnostics()
+        self.assertEqual(diag.verifier_mask_path, "position_aligned_2l")
+
+    def test_e2e_diagnostics(self):
+        model = _make_dummy_model()
+        tok = _make_dummy_tokenizer()
+        _, stats, diag = s2d2_decode(
+            model=model, tokenizer=tok, device=torch.device("cpu"),
+            mask_id=MASK_ID, vocab_size=VOCAB, prompt="hello",
+            max_new_tokens=4, max_steps=2,
+            routing_policy="always", seed=42, is_dummy=True,
+        )
+        d = diag.to_dict()
+        self.assertEqual(d["verifier_mask_path"], "position_aligned_2l")
+        self.assertNotIn("2n", d["verifier_mask_path"])
+
+
+# ---------------------------------------------------------------------------
+# 13. Right-shifted AR verifier path
+# ---------------------------------------------------------------------------
+class TestRightShiftedARPath(unittest.TestCase):
+    """Test that right_shifted_ar mode is detected and verifier inputs built correctly."""
+
+    def test_right_shifted_detection_for_dream(self):
+        """Models with 'dream' in name should get right_shifted_ar mode."""
+        import types
+        model = _make_dummy_model()
+        model.config = types.SimpleNamespace(name_or_path="dream-7b")
+        mode = detect_s2d2_verifier_mode(model)
+        self.assertEqual(mode, "right_shifted_ar")
+
+    def test_right_shifted_detection_for_fast_dllm(self):
+        import types
+        model = _make_dummy_model()
+        model.config = types.SimpleNamespace(name_or_path="fast-dllm-v2")
+        mode = detect_s2d2_verifier_mode(model)
+        self.assertEqual(mode, "right_shifted_ar")
+
+    def test_right_shifted_verifier_inputs_built(self):
+        """When mode is right_shifted_ar, verifier inputs use prefix-only (no 2L trick)."""
+        seq = torch.full((1, 8), MASK_ID, dtype=torch.long)
+        seq[0, :3] = torch.tensor([1, 2, 3])
+        span_start, span_end = 3, 6
+        # Build right-shifted style inputs
+        ver_inputs = S2D2VerifierInputs(
+            input_ids=seq[:, :span_start].clone(),
+            query_start=0,
+            query_end=span_end - span_start,
+            verifier_mode="right_shifted_ar",
+        )
+        self.assertEqual(ver_inputs.verifier_mode, "right_shifted_ar")
+        self.assertEqual(ver_inputs.input_ids.shape[1], span_start)
+        self.assertIsNone(ver_inputs.attention_mask_bool)
 
 
 if __name__ == "__main__":
