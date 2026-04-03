@@ -1,7 +1,7 @@
 import { KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
 import styles from "./InferencePlusPage.module.css";
 
-type InferenceMode = "RCD" | "OTS" | "S2D2";
+type InferenceMode = "RCD" | "OTS" | "S2D2" | "EntRGi";
 
 type DllmLoadStatus = "idle" | "loading" | "loaded" | "error" | "offline";
 
@@ -106,6 +106,24 @@ function defaultS2d2(): S2d2Config {
   };
 }
 
+interface EntRGiConfig {
+  entrgi_guidance_scale: number;
+  entrgi_guidance_steps: number;
+  entrgi_temperature: number;
+  entrgi_confidence_threshold: number;
+  entrgi_disable_guidance: boolean;
+}
+
+function defaultEntRGi(): EntRGiConfig {
+  return {
+    entrgi_guidance_scale: 0.5,
+    entrgi_guidance_steps: 3,
+    entrgi_temperature: 0.7,
+    entrgi_confidence_threshold: 0.3,
+    entrgi_disable_guidance: false,
+  };
+}
+
 function parseOptionalNumber(raw: string): number | undefined {
   const value = raw.trim();
   if (!value) return undefined;
@@ -187,6 +205,7 @@ export function InferencePlusPage() {
   const [rcd, setRcd] = useState(defaultRcd);
   const [ots, setOts] = useState(defaultOts);
   const [s2d2, setS2d2] = useState(defaultS2d2);
+  const [entrgi, setEntRGi] = useState(defaultEntRGi);
   const turnsRef = useRef<HTMLDivElement>(null);
   const abortCtrlRef = useRef<AbortController | null>(null);
 
@@ -443,7 +462,8 @@ export function InferencePlusPage() {
       const endpoint =
         mode === "RCD" ? "/api/inferencercdm"
         : mode === "OTS" ? "/api/inferenceots"
-        : "/api/inferences2d2";
+        : mode === "S2D2" ? "/api/inferences2d2"
+        : "/api/inferenceentrgi";
       const extra =
         mode === "RCD"
           ? {
@@ -463,7 +483,8 @@ export function InferencePlusPage() {
               ots_search_interval: ots.ots_search_interval,
               ots_pruning_mode: ots.ots_pruning_mode,
             }
-          : {
+          : mode === "S2D2"
+          ? {
               s2d2_block_size: s2d2.s2d2_block_size,
               s2d2_denoising_steps: s2d2.s2d2_denoising_steps,
               s2d2_routing_policy: s2d2.s2d2_routing_policy,
@@ -472,6 +493,13 @@ export function InferencePlusPage() {
               s2d2_confidence_threshold: s2d2.s2d2_confidence_threshold,
               s2d2_acceptance_estimator: s2d2.s2d2_acceptance_estimator,
               s2d2_entropy_beta: s2d2.s2d2_entropy_beta,
+            }
+          : {
+              entrgi_guidance_scale: entrgi.entrgi_guidance_scale,
+              entrgi_guidance_steps: entrgi.entrgi_guidance_steps,
+              entrgi_temperature: entrgi.entrgi_temperature,
+              entrgi_confidence_threshold: entrgi.entrgi_confidence_threshold,
+              entrgi_disable_guidance: entrgi.entrgi_disable_guidance,
             };
       const res = await fetch(endpoint, {
         method: "POST",
@@ -615,6 +643,16 @@ export function InferencePlusPage() {
                             <span className={styles.diagBadge}>block_size: {fmt(t.diagnostics.block_size)}</span>
                           </>
                         )}
+                        {t.mode === "EntRGi" && (
+                          <>
+                            <span className={styles.diagBadge}>reward: {fmt(t.diagnostics.reward_model_loaded)}</span>
+                            <span className={styles.diagBadge}>η: {fmt(t.diagnostics.guidance_scale)}</span>
+                            <span className={styles.diagBadge}>M: {fmt(t.diagnostics.guidance_steps)}</span>
+                            <span className={styles.diagBadge}>calls: {fmt(t.diagnostics.number_of_guidance_calls)}</span>
+                            <span className={styles.diagBadge}>avg_H: {fmt(t.diagnostics.avg_masked_entropy)}</span>
+                            <span className={styles.diagBadge}>avg_w: {fmt(t.diagnostics.avg_entropy_weight)}</span>
+                          </>
+                        )}
                       </div>
                     )}
                   </div>
@@ -735,13 +773,21 @@ export function InferencePlusPage() {
             >
               S2D2
             </button>
+            <button
+              className={`${styles.modeBtn} ${mode === "EntRGi" ? styles.modeBtnActive : ""}`}
+              onClick={() => setMode("EntRGi")}
+            >
+              EntRGi
+            </button>
           </div>
           <p style={{ margin: 0, color: "var(--text-dim)", fontSize: "0.78rem" }}>
             {mode === "RCD"
               ? "Residual Context Diffusion: ricicla i token scartati come prior contestuale."
               : mode === "OTS"
               ? "Order-Token Search: ricerca congiunta nell'ordine + spazio token."
-              : "S2D2: self-speculative decoding training-free. Stesso modello = drafter + verifier AR."}
+              : mode === "S2D2"
+              ? "S2D2: self-speculative decoding training-free. Stesso modello = drafter + verifier AR."
+              : "EntRGi: reward guidance entropy-aware. Gradienti dal reward model guidano i logit mascherati."}
           </p>
           {mode === "RCD" ? (
             <div className={`${styles.explainCard} ${rcdUsage.tone === "accent" ? styles.explainAccent : ""}`}>
@@ -773,11 +819,19 @@ export function InferencePlusPage() {
                 Nessun retraining: il routing decide quando verificare e il rejection sampling corregge i draft.
               </p>
             </div>
+          ) : (
+            <div className={styles.explainCard}>
+              <div className={styles.explainHead}>
+                <strong>Reward Guidance</strong>
+                <span>EntRGi runtime</span>
+              </div>
+              <p>
+                EntRGi usa un reward model frozen (Skywork-Reward-V2-Qwen3-0.6B) per guidare i logit
+                alle posizioni mascherate. L'interpolazione entropy-aware bilancia soft/hard embedding.
+              </p>
+            </div>
           )}
         </div>
-
-        <div className={styles.block}>
-          <h3>Parametri Comuni</h3>
           <div className={styles.fieldRow}>
             <div className={styles.field}>
               <label>Max Tokens</label>
@@ -1084,6 +1138,74 @@ export function InferencePlusPage() {
               S2D2 (arXiv:2603.25702): training-free self-speculative decoding.
               `min_span` = verifica se lo span mascherato ≥ τ_span.
               `always` = verifica ogni step. `never` = solo diffusion.
+            </p>
+          </div>
+        )}
+
+        {mode === "EntRGi" && (
+          <div className={styles.block}>
+            <h3>EntRGi Config</h3>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Guidance Scale (η)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={5.0}
+                  step={0.1}
+                  value={entrgi.entrgi_guidance_scale}
+                  onChange={(e) => setEntRGi((prev) => ({ ...prev, entrgi_guidance_scale: Number(e.target.value) }))}
+                />
+              </div>
+              <div className={styles.field}>
+                <label>Guidance Steps (M)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={entrgi.entrgi_guidance_steps}
+                  onChange={(e) => setEntRGi((prev) => ({ ...prev, entrgi_guidance_steps: Number(e.target.value) }))}
+                />
+              </div>
+            </div>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Temperature (τ)</label>
+                <input
+                  type="number"
+                  min={0.01}
+                  max={5.0}
+                  step={0.1}
+                  value={entrgi.entrgi_temperature}
+                  onChange={(e) => setEntRGi((prev) => ({ ...prev, entrgi_temperature: Number(e.target.value) }))}
+                />
+              </div>
+              <div className={styles.field}>
+                <label>Confidence Threshold</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={1.0}
+                  step={0.05}
+                  value={entrgi.entrgi_confidence_threshold}
+                  onChange={(e) => setEntRGi((prev) => ({ ...prev, entrgi_confidence_threshold: Number(e.target.value) }))}
+                />
+              </div>
+            </div>
+            <div className={styles.fieldCheck}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={entrgi.entrgi_disable_guidance}
+                  onChange={(e) => setEntRGi((prev) => ({ ...prev, entrgi_disable_guidance: e.target.checked }))}
+                />
+                <span>Disabilita guidance (ablazione)</span>
+              </label>
+              <small>Se attivo, bypassa il reward model e usa solo denoising standard.</small>
+            </div>
+            <p className={styles.inlineNote}>
+              EntRGi (arXiv:2602.05000): entropy-aware reward guidance. η=0.5, M=3, τ=0.7 sono i default del paper.
+              Reward model: Skywork-Reward-V2-Qwen3-0.6B (caricato automaticamente).
             </p>
           </div>
         )}

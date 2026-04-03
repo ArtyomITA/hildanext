@@ -31,6 +31,7 @@ from .trace import trace_from_cfg,set_active_trace,reset_active_trace,use_trace,
 from .inference_rcd import InferenceRCDMRequest as _InferenceRCDMRequest
 from .inference_ots import InferenceOTSRequest as _InferenceOTSRequest
 from .inference_s2d2 import InferenceS2D2Request as _InferenceS2D2Request
+from .inference_entrgi import InferenceEntRGiRequest as _InferenceEntRGiRequest
 
 class _LazyEngine:
     """Wraps build_engine() with lazy loading.
@@ -133,7 +134,7 @@ class HellaSwagItemRequest(BaseModel):
     stem:str
     endings:List[str]=Field(min_length=4,max_length=4)
     label_target:Optional[int]=Field(default=None,ge=0,le=3)
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2","ENTRGI"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -149,7 +150,7 @@ class MmluProItemRequest(BaseModel):
     question:str
     options:List[str]=Field(min_length=2,max_length=10)
     answer_label:str=Field(min_length=1,max_length=1)
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2","ENTRGI"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -166,7 +167,7 @@ class MmluProItemRequest(BaseModel):
 class Gsm8kItemRequest(BaseModel):
     question:str
     answer_target:str
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2","ENTRGI"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -182,7 +183,7 @@ class Gsm8kItemRequest(BaseModel):
 
 class Stage0StabilityRequest(BaseModel):
     prompt:str=Field(default="The capital of France is")
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2","ENTRGI"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -198,7 +199,7 @@ class Stage0StabilityRequest(BaseModel):
 
 class Stage0DetailedLogStartRequest(BaseModel):
     benchmark:Literal["hellaswag","mmlu-pro","gsm8k","stability"]
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2","ENTRGI"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     effort:str=Field(default="medium")
@@ -589,9 +590,9 @@ def _server_log(
 def _resolve_scope(scope:str)->Tuple[str,bool,bool]:
     s=str(scope or "DLLM").strip().upper()
     want_ar=s in {"AR","BOTH"}
-    want_dllm=s in {"DLLM","BOTH","RCD","OTS","S2D2"}
+    want_dllm=s in {"DLLM","BOTH","RCD","OTS","S2D2","ENTRGI"}
     if not (want_ar or want_dllm):
-        raise HTTPException(status_code=400,detail="scope must be AR, DLLM, BOTH, RCD, OTS, or S2D2")
+        raise HTTPException(status_code=400,detail="scope must be AR, DLLM, BOTH, RCD, OTS, S2D2, or ENTRGI")
     return s,want_ar,want_dllm
 
 
@@ -1454,6 +1455,25 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                         dllm_text=_s2d2_result["text"]
                         dllm_stats=_s2d2_result.get("stats",{})
                         dllm_stats["diagnostics"]=_s2d2_result.get("diagnostics",{})
+                    elif scope_norm=="ENTRGI":
+                        from .inference_entrgi import entrgi_decode as _entrgi_decode
+                        from .diffusion import force_noncausal_attention as _fnca_entrgi
+                        _b_entrgi=engine.bundle
+                        def _bench_entrgi():
+                            _txt,_st,_dg=_entrgi_decode(
+                                model=_b_entrgi.model,tokenizer=_b_entrgi.tokenizer,device=_b_entrgi.device,
+                                mask_id=_b_entrgi.mask_id,vocab_size=_b_entrgi.vocab_size,prompt=prompt_eval,
+                                max_new_tokens=max_new_tokens,seed=seed or 42,is_dummy=_b_entrgi.is_dummy,
+                                force_noncausal_ctx=_fnca_entrgi,
+                            )
+                            return {"text":_txt,"stats":_st,"diagnostics":_dg.to_dict()}
+                        _entrgi_result=_run_with_context(
+                            {"scope":scope_norm,"benchmark":benchmark,"prompt_preview":prompt_preview},
+                            _bench_entrgi,
+                        )
+                        dllm_text=_entrgi_result["text"]
+                        dllm_stats=_entrgi_result.get("stats",{})
+                        dllm_stats["diagnostics"]=_entrgi_result.get("diagnostics",{})
                     elif scope_norm=="INFERENZA2":
                         from .inference2 import inferenza2_decode as _inf2_decode
                         _inf2_result=_run_with_context(
@@ -3102,6 +3122,81 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
             raise HTTPException(status_code=500, detail=str(e))
     from .inference_s2d2 import InferenceS2D2Request as _InferenceS2D2Request  # noqa: E402
     # ---- end S2D2 endpoint ---------------------------------------------
+
+    # ---- EntRGi endpoint -----------------------------------------------
+    @app.post("/inferenceentrgi")
+    def inferenceentrgi(req: _InferenceEntRGiRequest):
+        from .inference_entrgi import InferenceEntRGiRequest as _EntRGiReqSchema  # noqa: F811
+        from .inference_entrgi import entrgi_decode
+        from .diffusion import force_noncausal_attention
+        from .inference import mode_thresholds, _resolve_effort
+        try:
+            def _do_entrgi():
+                bundle = getattr(engine, "bundle", None)
+                tokenizer = getattr(bundle, "tokenizer", None) if bundle is not None else None
+                if tokenizer is None:
+                    tokenizer = getattr(getattr(engine, "_engine", None), "tokenizer", None)
+                prompt_text = _build_prompt_from_chat(
+                    prompt=req.prompt,
+                    messages=req.messages,
+                    system_prompt=req.system_prompt,
+                    enable_thinking=req.enable_thinking,
+                    tokenizer=tokenizer,
+                )
+                if bundle is None:
+                    raise HTTPException(status_code=503, detail="Model not loaded")
+                model = bundle.model
+                device = bundle.device
+                mask_id = bundle.mask_id
+                v = bundle.vocab_size
+                is_dummy = bundle.is_dummy
+                tau_m, tau_e = mode_thresholds(engine._cfg, req.mode, req.tau_mask, req.tau_edit)
+                max_new = max(1, int(req.max_new_tokens))
+                eff_steps, tau_m, tau_e = _resolve_effort(
+                    req.effort, max(1, int(engine._cfg.inference.max_steps)), tau_m, tau_e,
+                )
+                text, stats, _diag = entrgi_decode(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    mask_id=mask_id,
+                    vocab_size=v,
+                    prompt=prompt_text,
+                    max_new_tokens=max_new,
+                    tau_mask=tau_m,
+                    tau_edit=tau_e,
+                    max_steps=eff_steps,
+                    reward_model_name=req.entrgi_reward_model,
+                    guidance_scale=req.entrgi_guidance_scale,
+                    guidance_steps=req.entrgi_guidance_steps,
+                    entrgi_temperature=req.entrgi_temperature,
+                    confidence_threshold=req.entrgi_confidence_threshold,
+                    disable_guidance=req.entrgi_disable_guidance,
+                    store_diagnostics=req.entrgi_store_diagnostics,
+                    seed=req.seed if req.seed is not None else int(engine._cfg.runtime.seed),
+                    is_dummy=is_dummy,
+                    force_noncausal_ctx=force_noncausal_attention,
+                )
+                return text, stats
+            (text, stats), wait_ms = _run_with_inference_lock(_do_entrgi)
+            stats["queue_wait_ms"] = wait_ms
+            stats["serialized_inference"] = serialize_inference
+            stats["fallbacks"] = tr.snapshot_fallbacks(limit=128)
+            return {"text": text, "stats": stats, "engine": "entrgi",
+                    "diagnostics": stats.get("entrgi_diagnostics", {})}
+        except HTTPException:
+            raise
+        except Exception as e:
+            _server_log("ENTRGI_REQ_ERROR", str(e), level="error", scope="ENTRGI")
+            if _is_oom_error(e) and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                raise HTTPException(status_code=503, detail="CUDA OOM in EntRGi inference")
+            raise HTTPException(status_code=500, detail=str(e))
+    from .inference_entrgi import InferenceEntRGiRequest as _InferenceEntRGiRequest  # noqa: E402
+    # ---- end EntRGi endpoint -------------------------------------------
 
     # ---- Inferenza2 hybrid endpoint ------------------------------------
     @app.post("/inferenza2")
