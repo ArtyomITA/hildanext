@@ -12,7 +12,7 @@ const HELLASWAG_SUBSET_LIMIT = 8;
 const MMLU_PRO_SUBSET_LIMIT = 150;
 const GSM8K_SUBSET_LIMIT = 100;
 
-type BenchScope = "AR" | "DLLM" | "BOTH" | "RCD" | "OTS";
+type BenchScope = "AR" | "DLLM" | "BOTH" | "RCD" | "OTS" | "S2D2";
 type GlobalEffort = "low" | "medium" | "high";
 type DecodeStrategy = "greedy" | "sampling";
 type StabilityMaskSchedule = "linear" | "cosine";
@@ -1011,6 +1011,7 @@ export function Stage0Validation() {
               <option value="BOTH">Both</option>
               <option value="RCD">dLLM (RCD)</option>
               <option value="OTS">dLLM (OTS)</option>
+              <option value="S2D2">dLLM (S2D2)</option>
             </select>
           </label>
           <label className={styles.inlineField}>

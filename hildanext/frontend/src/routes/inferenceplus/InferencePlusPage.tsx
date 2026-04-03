@@ -1,7 +1,7 @@
 import { KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
 import styles from "./InferencePlusPage.module.css";
 
-type InferenceMode = "RCD" | "OTS";
+type InferenceMode = "RCD" | "OTS" | "S2D2";
 
 type DllmLoadStatus = "idle" | "loading" | "loaded" | "error" | "offline";
 
@@ -44,20 +44,99 @@ interface TurnResult {
 
 interface RcdConfig {
   rcd_temperature_residual: number;
+  rcd_latent_logits_temperature: string;
   rcd_warm_start: boolean;
+  rcd_reference_model: string;
+  rcd_same_model_warm_start_fallback: boolean;
+  rcd_single_token_mode: boolean;
+  rcd_force_mask_only_injection: boolean;
 }
 
 interface OtsConfig {
   ots_beam_size: number;
   ots_gumbel_temperature: number;
+  ots_search_interval: number;
+  ots_block_size: number;
+  ots_pruning_mode: "diffusion_likelihood" | "fallback_confidence";
+}
+
+interface S2d2Config {
+  s2d2_block_size: number;
+  s2d2_denoising_steps: number;
+  s2d2_routing_policy: "min_span" | "score_threshold" | "hysteresis" | "always" | "never";
+  s2d2_min_verify_span: number;
+  s2d2_score_threshold: number;
+  s2d2_confidence_threshold: number;
+  s2d2_acceptance_estimator: "entropy" | "margin";
+  s2d2_entropy_beta: number;
 }
 
 function defaultRcd(): RcdConfig {
-  return { rcd_temperature_residual: 1.0, rcd_warm_start: true };
+  return {
+    rcd_temperature_residual: 1.0,
+    rcd_latent_logits_temperature: "",
+    rcd_warm_start: true,
+    rcd_reference_model: "",
+    rcd_same_model_warm_start_fallback: true,
+    rcd_single_token_mode: true,
+    rcd_force_mask_only_injection: true,
+  };
 }
 
 function defaultOts(): OtsConfig {
-  return { ots_beam_size: 3, ots_gumbel_temperature: 0.6 };
+  return {
+    ots_beam_size: 3,
+    ots_gumbel_temperature: 0.6,
+    ots_search_interval: 0,
+    ots_block_size: 32,
+    ots_pruning_mode: "diffusion_likelihood",
+  };
+}
+
+function defaultS2d2(): S2d2Config {
+  return {
+    s2d2_block_size: 32,
+    s2d2_denoising_steps: 0,
+    s2d2_routing_policy: "min_span",
+    s2d2_min_verify_span: 2,
+    s2d2_score_threshold: 0.0,
+    s2d2_confidence_threshold: 0.3,
+    s2d2_acceptance_estimator: "entropy",
+    s2d2_entropy_beta: 1.0,
+  };
+}
+
+function parseOptionalNumber(raw: string): number | undefined {
+  const value = raw.trim();
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function describeRcdModelUsage(config: RcdConfig): {
+  title: string;
+  body: string;
+  tone: "calm" | "accent";
+} {
+  if (!config.rcd_warm_start) {
+    return {
+      title: "1 modello",
+      body: "Il target model genera direttamente senza warm-start RCD. Nessun reference model viene caricato.",
+      tone: "calm",
+    };
+  }
+  if (config.rcd_reference_model.trim()) {
+    return {
+      title: "2 modelli",
+      body: "Il target model genera i token. Il reference model separato viene caricato solo per inizializzare il warm-start RCD.",
+      tone: "accent",
+    };
+  }
+  return {
+    title: "1 modello",
+    body: "Il target model fa sia warm-start sia generazione. E' la modalita piu leggera, ma meno fedele alla recipe ufficiale con Mref separato.",
+    tone: "calm",
+  };
 }
 
 function fmt(v: unknown): string {
@@ -107,7 +186,9 @@ export function InferencePlusPage() {
   const [seed, setSeed] = useState<number | null>(null);
   const [rcd, setRcd] = useState(defaultRcd);
   const [ots, setOts] = useState(defaultOts);
+  const [s2d2, setS2d2] = useState(defaultS2d2);
   const turnsRef = useRef<HTMLDivElement>(null);
+  const abortCtrlRef = useRef<AbortController | null>(null);
 
   // ── Weight loading state ──
   const [dllmLoad, setDllmLoad] = useState<DllmLoadState>({
@@ -128,6 +209,7 @@ export function InferencePlusPage() {
   const lastInferEventIdRef = useRef<string>("");
 
   const weightsReady = dllmLoad.status === "loaded";
+  const rcdUsage = describeRcdModelUsage(rcd);
 
   function appendRealtimeEvents(items: InferenceRealtimeEvent[]) {
     if (items.length === 0) return;
@@ -227,7 +309,7 @@ export function InferencePlusPage() {
           setInferLogTransport("sse");
           setInferLogError("");
         };
-        stream.onmessage = (event: MessageEvent<string>) => {
+        const _handleSseMsg = (event: MessageEvent<string>) => {
           if (closed) return;
           let parsed: unknown = {};
           try { parsed = JSON.parse(String(event.data || "{}")); } catch { return; }
@@ -235,6 +317,9 @@ export function InferencePlusPage() {
           if (!row) return;
           appendRealtimeEvents([row]);
         };
+        stream.onmessage = _handleSseMsg;
+        // Backend emits named event "inference", not default "message"
+        stream.addEventListener("inference", _handleSseMsg as EventListener);
         stream.onerror = () => {
           if (closed) return;
           setInferLogError("SSE disconnected, switching to polling.");
@@ -326,10 +411,17 @@ export function InferencePlusPage() {
     }
   }
 
+  function handleCancel() {
+    abortCtrlRef.current?.abort();
+  }
+
   async function send() {
     const prompt = draft.trim();
     if (!prompt || running) return;
     setDraft("");
+    abortCtrlRef.current?.abort();
+    const ctrl = new AbortController();
+    abortCtrlRef.current = ctrl;
     const id = crypto.randomUUID();
     const turn: TurnResult = {
       id,
@@ -348,16 +440,38 @@ export function InferencePlusPage() {
 
     const t0 = performance.now();
     try {
-      const endpoint = mode === "RCD" ? "/api/inferencercdm" : "/api/inferenceots";
+      const endpoint =
+        mode === "RCD" ? "/api/inferencercdm"
+        : mode === "OTS" ? "/api/inferenceots"
+        : "/api/inferences2d2";
       const extra =
         mode === "RCD"
           ? {
               rcd_temperature_residual: rcd.rcd_temperature_residual,
+              rcd_latent_logits_temperature: parseOptionalNumber(rcd.rcd_latent_logits_temperature),
               rcd_warm_start: rcd.rcd_warm_start,
+              rcd_reference_model: rcd.rcd_reference_model.trim() || undefined,
+              rcd_same_model_warm_start_fallback: rcd.rcd_same_model_warm_start_fallback,
+              rcd_single_token_mode: rcd.rcd_single_token_mode,
+              rcd_force_mask_only_injection: rcd.rcd_force_mask_only_injection,
+            }
+          : mode === "OTS"
+          ? {
+              ots_beam_size: ots.ots_beam_size,
+              ots_block_size: ots.ots_block_size,
+              ots_gumbel_temperature: ots.ots_gumbel_temperature,
+              ots_search_interval: ots.ots_search_interval,
+              ots_pruning_mode: ots.ots_pruning_mode,
             }
           : {
-              ots_beam_size: ots.ots_beam_size,
-              ots_gumbel_temperature: ots.ots_gumbel_temperature,
+              s2d2_block_size: s2d2.s2d2_block_size,
+              s2d2_denoising_steps: s2d2.s2d2_denoising_steps,
+              s2d2_routing_policy: s2d2.s2d2_routing_policy,
+              s2d2_min_verify_span: s2d2.s2d2_min_verify_span,
+              s2d2_score_threshold: s2d2.s2d2_score_threshold,
+              s2d2_confidence_threshold: s2d2.s2d2_confidence_threshold,
+              s2d2_acceptance_estimator: s2d2.s2d2_acceptance_estimator,
+              s2d2_entropy_beta: s2d2.s2d2_entropy_beta,
             };
       const res = await fetch(endpoint, {
         method: "POST",
@@ -369,6 +483,7 @@ export function InferencePlusPage() {
           effort,
           ...extra,
         }),
+        signal: ctrl.signal,
       });
       const elapsed = performance.now() - t0;
       if (!res.ok) {
@@ -392,6 +507,11 @@ export function InferencePlusPage() {
         ),
       );
     } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        setTurns((prev) => prev.filter((t) => t.id !== id));
+        setRunning(false);
+        return;
+      }
       const elapsed = performance.now() - t0;
       setTurns((prev) =>
         prev.map((t) =>
@@ -450,7 +570,7 @@ export function InferencePlusPage() {
               {t.status === "success" && (
                 <div className={styles.assistantBlock}>
                   <div className={styles.assistantHead}>
-                    <strong>{t.mode} — {t.engine}</strong>
+                    <strong>{t.mode}</strong>
                     <span>{t.elapsedMs != null ? `${(t.elapsedMs / 1000).toFixed(2)}s` : ""}</span>
                   </div>
                   <div className={`${styles.laneCard} ${styles.laneSuccess}`}>
@@ -463,7 +583,7 @@ export function InferencePlusPage() {
                       <dt>Engine</dt><dd>{t.engine}</dd>
                       <dt>Tempo</dt><dd>{t.elapsedMs != null ? `${(t.elapsedMs / 1000).toFixed(2)}s` : "—"}</dd>
                       <dt>Tok/s</dt><dd>{fmt(t.stats.tokens_per_sec)}</dd>
-                      <dt>Steps</dt><dd>{fmt(t.stats.steps_to_converge ?? t.stats.total_denoising_steps)}</dd>
+                      <dt>Steps</dt><dd>{fmt(t.stats.steps ?? t.stats.total_denoising_steps)}</dd>
                     </dl>
                     {/* Diagnostics badges */}
                     {Object.keys(t.diagnostics).length > 0 && (
@@ -471,15 +591,28 @@ export function InferencePlusPage() {
                         {t.mode === "RCD" && (
                           <>
                             <span className={styles.diagBadge}>warm_start: {fmt(t.diagnostics.warm_start_used)}</span>
-                            <span className={styles.diagBadge}>T_res: {fmt(t.diagnostics.T_res_used)}</span>
-                            <span className={styles.diagBadge}>avg_α: {fmt(t.diagnostics.avg_alpha)}</span>
+                            <span className={styles.diagBadge}>ref_model: {fmt(t.diagnostics.reference_model_used)}</span>
+                            <span className={styles.diagBadge}>T_res: {fmt(t.diagnostics.t_res)}</span>
+                            <span className={styles.diagBadge}>steps: {fmt(t.diagnostics.total_denoising_steps)}</span>
                           </>
                         )}
                         {t.mode === "OTS" && (
                           <>
                             <span className={styles.diagBadge}>beams: {fmt(t.diagnostics.total_beams_explored)}</span>
                             <span className={styles.diagBadge}>checkpoints: {fmt(t.diagnostics.total_search_checkpoints)}</span>
+                            <span className={styles.diagBadge}>block_size: {fmt(t.stats.block_size)}</span>
                             <span className={styles.diagBadge}>pruning: {fmt(t.diagnostics.pruning_mode_used)}</span>
+                            <span className={styles.diagBadge}>best_score: {fmt(t.diagnostics.chosen_beam_score)}</span>
+                          </>
+                        )}
+                        {t.mode === "S2D2" && (
+                          <>
+                            <span className={styles.diagBadge}>verify: {fmt(t.diagnostics.verifier_invocations)}</span>
+                            <span className={styles.diagBadge}>skip: {fmt(t.diagnostics.verifier_skips)}</span>
+                            <span className={styles.diagBadge}>avg_accept: {fmt(t.diagnostics.avg_accepted_prefix_length)}</span>
+                            <span className={styles.diagBadge}>fallback: {fmt(t.diagnostics.fallback_to_diffusion_count)}</span>
+                            <span className={styles.diagBadge}>routing: {fmt(t.diagnostics.routing_policy_used)}</span>
+                            <span className={styles.diagBadge}>block_size: {fmt(t.diagnostics.block_size)}</span>
                           </>
                         )}
                       </div>
@@ -508,8 +641,8 @@ export function InferencePlusPage() {
               <p className={styles.composerLock}>Caricamento pesi in corso…</p>
             )}
           </div>
-          <button onClick={send} disabled={running || !draft.trim() || loadingWeights || !weightsReady}>
-            {running ? "…" : "Genera"}
+          <button onClick={running ? handleCancel : send} disabled={loadingWeights || !weightsReady || (!running && !draft.trim())}>
+            {running ? "Annulla" : "Genera"}
           </button>
         </div>
       </section>
@@ -596,12 +729,51 @@ export function InferencePlusPage() {
             >
               OTS
             </button>
+            <button
+              className={`${styles.modeBtn} ${mode === "S2D2" ? styles.modeBtnActive : ""}`}
+              onClick={() => setMode("S2D2")}
+            >
+              S2D2
+            </button>
           </div>
           <p style={{ margin: 0, color: "var(--text-dim)", fontSize: "0.78rem" }}>
             {mode === "RCD"
               ? "Residual Context Diffusion: ricicla i token scartati come prior contestuale."
-              : "Order-Token Search: ricerca congiunta nell'ordine + spazio token."}
+              : mode === "OTS"
+              ? "Order-Token Search: ricerca congiunta nell'ordine + spazio token."
+              : "S2D2: self-speculative decoding training-free. Stesso modello = drafter + verifier AR."}
           </p>
+          {mode === "RCD" ? (
+            <div className={`${styles.explainCard} ${rcdUsage.tone === "accent" ? styles.explainAccent : ""}`}>
+              <div className={styles.explainHead}>
+                <strong>{rcdUsage.title}</strong>
+                <span>RCD runtime</span>
+              </div>
+              <p>{rcdUsage.body}</p>
+            </div>
+          ) : mode === "OTS" ? (
+            <div className={styles.explainCard}>
+              <div className={styles.explainHead}>
+                <strong>Ricerca a beam</strong>
+                <span>OTS runtime</span>
+              </div>
+              <p>
+                OTS usa un solo modello, ma moltiplica le traiettorie attive con i beam e i checkpoint.
+                I parametri sotto controllano quanto ramifica e come pota i candidati.
+              </p>
+            </div>
+          ) : (
+            <div className={styles.explainCard}>
+              <div className={styles.explainHead}>
+                <strong>Self-Speculation</strong>
+                <span>S2D2 runtime</span>
+              </div>
+              <p>
+                S2D2 usa lo stesso modello come drafter (diffusion) e verifier (AR block-size-1).
+                Nessun retraining: il routing decide quando verificare e il rejection sampling corregge i draft.
+              </p>
+            </div>
+          )}
         </div>
 
         <div className={styles.block}>
@@ -640,27 +812,90 @@ export function InferencePlusPage() {
         {mode === "RCD" && (
           <div className={styles.block}>
             <h3>RCD Config</h3>
-            <div className={styles.field}>
-              <label>T_res (temperatura residui)</label>
-              <input
-                type="number"
-                min={0.1}
-                max={5.0}
-                step={0.1}
-                value={rcd.rcd_temperature_residual}
-                onChange={(e) => setRcd((prev) => ({ ...prev, rcd_temperature_residual: Number(e.target.value) }))}
-              />
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>T_res</label>
+                <input
+                  type="number"
+                  min={0.1}
+                  max={5.0}
+                  step={0.1}
+                  value={rcd.rcd_temperature_residual}
+                  onChange={(e) => setRcd((prev) => ({ ...prev, rcd_temperature_residual: Number(e.target.value) }))}
+                />
+              </div>
+              <div className={styles.field}>
+                <label>Latent Logits Temp</label>
+                <input
+                  type="number"
+                  min={0.1}
+                  max={5.0}
+                  step={0.01}
+                  value={rcd.rcd_latent_logits_temperature}
+                  onChange={(e) => setRcd((prev) => ({ ...prev, rcd_latent_logits_temperature: e.target.value }))}
+                  placeholder="vuoto = usa T_res"
+                />
+              </div>
             </div>
-            <div className={styles.field}>
+            <div className={styles.fieldCheck}>
               <label>
                 <input
                   type="checkbox"
                   checked={rcd.rcd_warm_start}
                   onChange={(e) => setRcd((prev) => ({ ...prev, rcd_warm_start: e.target.checked }))}
-                />{" "}
-                Warm Start
+                />
+                <span>Warm Start RCD</span>
+              </label>
+              <small>Se disattivo, usa solo il target model e salta l'inizializzazione residua.</small>
+            </div>
+            {rcd.rcd_warm_start && (
+              <>
+                <div className={styles.field}>
+                  <label>Reference Model Path</label>
+                  <input
+                    type="text"
+                    value={rcd.rcd_reference_model}
+                    onChange={(e) => setRcd((prev) => ({ ...prev, rcd_reference_model: e.target.value }))}
+                    placeholder="opzionale: path locale a Mref"
+                  />
+                </div>
+                <div className={styles.fieldCheck}>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={rcd.rcd_same_model_warm_start_fallback}
+                      onChange={(e) => setRcd((prev) => ({ ...prev, rcd_same_model_warm_start_fallback: e.target.checked }))}
+                    />
+                    <span>Fallback allo stesso target model se Mref manca</span>
+                  </label>
+                </div>
+              </>
+            )}
+            <div className={styles.fieldCheck}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={rcd.rcd_single_token_mode}
+                  onChange={(e) => setRcd((prev) => ({ ...prev, rcd_single_token_mode: e.target.checked }))}
+                />
+                <span>Single-token-per-step</span>
+              </label>
+              <small>Consigliato per recipe LLaDA/RCD ufficiali e per setup Qwen + WSD LLaDA.</small>
+            </div>
+            <div className={styles.fieldCheck}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={rcd.rcd_force_mask_only_injection}
+                  onChange={(e) => setRcd((prev) => ({ ...prev, rcd_force_mask_only_injection: e.target.checked }))}
+                />
+                <span>Residual injection solo su [MASK]</span>
               </label>
             </div>
+            <p className={styles.inlineNote}>
+              `Latent Logits Temp` corrisponde al naming usato nella repo ufficiale RCD-LLaDA.
+              Se lo lasci vuoto, il backend riusa `T_res`.
+            </p>
           </div>
         )}
 
@@ -690,6 +925,166 @@ export function InferencePlusPage() {
                 />
               </div>
             </div>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Block Size</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={512}
+                  step={8}
+                  value={ots.ots_block_size}
+                  onChange={(e) => setOts((prev) => ({ ...prev, ots_block_size: Number(e.target.value) }))}
+                />
+              </div>
+              <div className={styles.field}>
+                <label>Search Interval</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={256}
+                  value={ots.ots_search_interval}
+                  onChange={(e) => setOts((prev) => ({ ...prev, ots_search_interval: Number(e.target.value) }))}
+                />
+              </div>
+            </div>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Pruning Mode</label>
+                <select
+                  value={ots.ots_pruning_mode}
+                  onChange={(e) =>
+                    setOts((prev) => ({
+                      ...prev,
+                      ots_pruning_mode: e.target.value as OtsConfig["ots_pruning_mode"],
+                    }))
+                  }
+                >
+                  <option value="diffusion_likelihood">diffusion_likelihood</option>
+                  <option value="fallback_confidence">fallback_confidence</option>
+                </select>
+              </div>
+            </div>
+            <p className={styles.inlineNote}>
+              `Block Size = 32` è il default del paper (Alg.1). `Search Interval = 0` = auto.
+              `diffusion_likelihood` è fedele a Eq.(2), `fallback_confidence` è diagnostica.
+            </p>
+          </div>
+        )}
+
+        {mode === "S2D2" && (
+          <div className={styles.block}>
+            <h3>S2D2 Config</h3>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Block Size</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={512}
+                  step={8}
+                  value={s2d2.s2d2_block_size}
+                  onChange={(e) => setS2d2((prev) => ({ ...prev, s2d2_block_size: Number(e.target.value) }))}
+                />
+              </div>
+              <div className={styles.field}>
+                <label>Denoising Steps (0=auto)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={256}
+                  value={s2d2.s2d2_denoising_steps}
+                  onChange={(e) => setS2d2((prev) => ({ ...prev, s2d2_denoising_steps: Number(e.target.value) }))}
+                />
+              </div>
+            </div>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Routing Policy</label>
+                <select
+                  value={s2d2.s2d2_routing_policy}
+                  onChange={(e) =>
+                    setS2d2((prev) => ({
+                      ...prev,
+                      s2d2_routing_policy: e.target.value as S2d2Config["s2d2_routing_policy"],
+                    }))
+                  }
+                >
+                  <option value="min_span">min_span</option>
+                  <option value="score_threshold">score_threshold</option>
+                  <option value="hysteresis">hysteresis</option>
+                  <option value="always">always</option>
+                  <option value="never">never</option>
+                </select>
+              </div>
+              <div className={styles.field}>
+                <label>Min Verify Span (τ_span)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={256}
+                  value={s2d2.s2d2_min_verify_span}
+                  onChange={(e) => setS2d2((prev) => ({ ...prev, s2d2_min_verify_span: Number(e.target.value) }))}
+                />
+              </div>
+            </div>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Confidence Threshold (τ)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={1.0}
+                  step={0.05}
+                  value={s2d2.s2d2_confidence_threshold}
+                  onChange={(e) => setS2d2((prev) => ({ ...prev, s2d2_confidence_threshold: Number(e.target.value) }))}
+                />
+              </div>
+              <div className={styles.field}>
+                <label>Acceptance Estimator</label>
+                <select
+                  value={s2d2.s2d2_acceptance_estimator}
+                  onChange={(e) =>
+                    setS2d2((prev) => ({
+                      ...prev,
+                      s2d2_acceptance_estimator: e.target.value as S2d2Config["s2d2_acceptance_estimator"],
+                    }))
+                  }
+                >
+                  <option value="entropy">entropy</option>
+                  <option value="margin">margin</option>
+                </select>
+              </div>
+            </div>
+            <div className={styles.fieldRow}>
+              <div className={styles.field}>
+                <label>Entropy β</label>
+                <input
+                  type="number"
+                  min={0.01}
+                  max={5.0}
+                  step={0.25}
+                  value={s2d2.s2d2_entropy_beta}
+                  onChange={(e) => setS2d2((prev) => ({ ...prev, s2d2_entropy_beta: Number(e.target.value) }))}
+                />
+              </div>
+              <div className={styles.field}>
+                <label>Score Threshold (τ_score)</label>
+                <input
+                  type="number"
+                  min={-10}
+                  max={10}
+                  step={0.5}
+                  value={s2d2.s2d2_score_threshold}
+                  onChange={(e) => setS2d2((prev) => ({ ...prev, s2d2_score_threshold: Number(e.target.value) }))}
+                />
+              </div>
+            </div>
+            <p className={styles.inlineNote}>
+              S2D2 (arXiv:2603.25702): training-free self-speculative decoding.
+              `min_span` = verifica se lo span mascherato ≥ τ_span.
+              `always` = verifica ogni step. `never` = solo diffusion.
+            </p>
           </div>
         )}
       </section>

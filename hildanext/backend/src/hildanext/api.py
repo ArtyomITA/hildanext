@@ -24,10 +24,13 @@ from fastapi import FastAPI,HTTPException,Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
-from .config import AppConfig,load_config
+from .config import AppConfig,clone_with_updates,load_config
 from .inference import build_engine
 from .stage0_benchmarks import load_hellaswag_items,load_mmlu_pro_items,load_gsm8k_items
 from .trace import trace_from_cfg,set_active_trace,reset_active_trace,use_trace,exception_with_stack
+from .inference_rcd import InferenceRCDMRequest as _InferenceRCDMRequest
+from .inference_ots import InferenceOTSRequest as _InferenceOTSRequest
+from .inference_s2d2 import InferenceS2D2Request as _InferenceS2D2Request
 
 class _LazyEngine:
     """Wraps build_engine() with lazy loading.
@@ -130,7 +133,7 @@ class HellaSwagItemRequest(BaseModel):
     stem:str
     endings:List[str]=Field(min_length=4,max_length=4)
     label_target:Optional[int]=Field(default=None,ge=0,le=3)
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -146,7 +149,7 @@ class MmluProItemRequest(BaseModel):
     question:str
     options:List[str]=Field(min_length=2,max_length=10)
     answer_label:str=Field(min_length=1,max_length=1)
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -163,7 +166,7 @@ class MmluProItemRequest(BaseModel):
 class Gsm8kItemRequest(BaseModel):
     question:str
     answer_target:str
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -179,7 +182,7 @@ class Gsm8kItemRequest(BaseModel):
 
 class Stage0StabilityRequest(BaseModel):
     prompt:str=Field(default="The capital of France is")
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     temperature:Optional[float]=Field(default=None,ge=0.0,le=2.0)
@@ -195,7 +198,7 @@ class Stage0StabilityRequest(BaseModel):
 
 class Stage0DetailedLogStartRequest(BaseModel):
     benchmark:Literal["hellaswag","mmlu-pro","gsm8k","stability"]
-    scope:Literal["AR","DLLM","BOTH","RCD","OTS"]="DLLM"
+    scope:Literal["AR","DLLM","BOTH","RCD","OTS","S2D2"]="DLLM"
     context_window:Optional[int]=Field(default=None,ge=256,le=8192)
     decode_strategy:Literal["greedy","sampling"]="greedy"
     effort:str=Field(default="medium")
@@ -586,9 +589,9 @@ def _server_log(
 def _resolve_scope(scope:str)->Tuple[str,bool,bool]:
     s=str(scope or "DLLM").strip().upper()
     want_ar=s in {"AR","BOTH"}
-    want_dllm=s in {"DLLM","BOTH","RCD","OTS"}
+    want_dllm=s in {"DLLM","BOTH","RCD","OTS","S2D2"}
     if not (want_ar or want_dllm):
-        raise HTTPException(status_code=400,detail="scope must be AR, DLLM, BOTH, RCD, or OTS")
+        raise HTTPException(status_code=400,detail="scope must be AR, DLLM, BOTH, RCD, OTS, or S2D2")
     return s,want_ar,want_dllm
 
 
@@ -1396,28 +1399,61 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                     )
                     if scope_norm=="RCD":
                         from .inference_rcd import rcd_decode as _rcd_decode
+                        from .diffusion import force_noncausal_attention as _fnca_rcd
+                        _b_rcd=engine.bundle
+                        def _bench_rcd():
+                            _txt,_st,_dg=_rcd_decode(
+                                model=_b_rcd.model,tokenizer=_b_rcd.tokenizer,device=_b_rcd.device,
+                                mask_id=_b_rcd.mask_id,vocab_size=_b_rcd.vocab_size,prompt=prompt_eval,
+                                max_new_tokens=max_new_tokens,seed=seed or 42,is_dummy=_b_rcd.is_dummy,
+                                force_noncausal_ctx=_fnca_rcd,
+                            )
+                            return {"text":_txt,"stats":_st,"diagnostics":_dg.to_dict()}
                         _rcd_result=_run_with_context(
                             {"scope":scope_norm,"benchmark":benchmark,"prompt_preview":prompt_preview},
-                            lambda:_rcd_decode(
-                                engine.bundle,prompt_eval,
-                                max_new_tokens=max_new_tokens,seed=seed,effort=effort,
-                            ),
+                            _bench_rcd,
                         )
                         dllm_text=_rcd_result["text"]
                         dllm_stats=_rcd_result.get("stats",{})
                         dllm_stats["diagnostics"]=_rcd_result.get("diagnostics",{})
                     elif scope_norm=="OTS":
                         from .inference_ots import ots_decode as _ots_decode
+                        from .diffusion import force_noncausal_attention as _fnca_ots
+                        _b_ots=engine.bundle
+                        def _bench_ots():
+                            _txt,_st,_dg=_ots_decode(
+                                model=_b_ots.model,tokenizer=_b_ots.tokenizer,device=_b_ots.device,
+                                mask_id=_b_ots.mask_id,vocab_size=_b_ots.vocab_size,prompt=prompt_eval,
+                                max_new_tokens=max_new_tokens,seed=seed or 42,is_dummy=_b_ots.is_dummy,
+                                force_noncausal_ctx=_fnca_ots,
+                            )
+                            return {"text":_txt,"stats":_st,"diagnostics":_dg.to_dict()}
                         _ots_result=_run_with_context(
                             {"scope":scope_norm,"benchmark":benchmark,"prompt_preview":prompt_preview},
-                            lambda:_ots_decode(
-                                engine.bundle,prompt_eval,
-                                max_new_tokens=max_new_tokens,seed=seed,effort=effort,
-                            ),
+                            _bench_ots,
                         )
                         dllm_text=_ots_result["text"]
                         dllm_stats=_ots_result.get("stats",{})
                         dllm_stats["diagnostics"]=_ots_result.get("diagnostics",{})
+                    elif scope_norm=="S2D2":
+                        from .inference_s2d2 import s2d2_decode as _s2d2_decode
+                        from .diffusion import force_noncausal_attention as _fnca_s2d2
+                        _b_s2d2=engine.bundle
+                        def _bench_s2d2():
+                            _txt,_st,_dg=_s2d2_decode(
+                                model=_b_s2d2.model,tokenizer=_b_s2d2.tokenizer,device=_b_s2d2.device,
+                                mask_id=_b_s2d2.mask_id,vocab_size=_b_s2d2.vocab_size,prompt=prompt_eval,
+                                max_new_tokens=max_new_tokens,seed=seed or 42,is_dummy=_b_s2d2.is_dummy,
+                                force_noncausal_ctx=_fnca_s2d2,
+                            )
+                            return {"text":_txt,"stats":_st,"diagnostics":_dg.to_dict()}
+                        _s2d2_result=_run_with_context(
+                            {"scope":scope_norm,"benchmark":benchmark,"prompt_preview":prompt_preview},
+                            _bench_s2d2,
+                        )
+                        dllm_text=_s2d2_result["text"]
+                        dllm_stats=_s2d2_result.get("stats",{})
+                        dllm_stats["diagnostics"]=_s2d2_result.get("diagnostics",{})
                     elif scope_norm=="INFERENZA2":
                         from .inference2 import inferenza2_decode as _inf2_decode
                         _inf2_result=_run_with_context(
@@ -2811,7 +2847,7 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
 
     # ---- RCD inference endpoint ----------------------------------------
     @app.post("/inferencercdm")
-    def inferencercdm(req:"_InferenceRCDMRequest"):
+    def inferencercdm(req: _InferenceRCDMRequest):
         from .inference_rcd import InferenceRCDMRequest as _RCDReqSchema  # noqa: F811
         from .inference_rcd import rcd_decode
         from .diffusion import force_noncausal_attention
@@ -2843,17 +2879,21 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                 )
                 # Warm-start reference model handling
                 warm_start_model = None
-                ref_model_used = False
                 if req.rcd_warm_start and req.rcd_reference_model:
                     try:
                         from .inference import load_model_bundle
-                        # Load separate reference model — expensive, cached externally if needed
-                        ref_cfg = engine._cfg
-                        warm_start_model = None  # placeholder: would need full load
-                        # DEVIATION: full Mref loading not implemented in this MVP;
-                        # fallback to same-model warm start.
+                        ref_cfg = clone_with_updates(
+                            engine._cfg,
+                            {
+                                "paths": {"model_dir": req.rcd_reference_model},
+                                "runtime": {"force_dummy_model": False},
+                            },
+                        )
+                        ref_bundle = load_model_bundle(ref_cfg, for_training=False, trace=tr)
+                        if not ref_bundle.is_dummy:
+                            warm_start_model = ref_bundle.model
                     except Exception:
-                        pass
+                        warm_start_model = None
                 if warm_start_model is None and req.rcd_warm_start and not req.rcd_same_model_warm_start_fallback:
                     if req.rcd_reference_model:
                         raise HTTPException(
@@ -2873,10 +2913,12 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                     tau_edit=tau_e,
                     max_steps=eff_steps,
                     t_res=req.rcd_temperature_residual,
+                    latent_logits_temperature=req.rcd_latent_logits_temperature,
                     alpha_mode=req.rcd_alpha_mode,
                     force_mask_only=req.rcd_force_mask_only_injection,
                     warm_start=req.rcd_warm_start,
                     warm_start_model=warm_start_model,
+                    single_token_mode=req.rcd_single_token_mode,
                     store_diagnostics=req.rcd_store_step_diagnostics,
                     seed=req.seed if req.seed is not None else int(engine._cfg.runtime.seed),
                     is_dummy=is_dummy,
@@ -2887,7 +2929,7 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
             stats["queue_wait_ms"] = wait_ms
             stats["serialized_inference"] = serialize_inference
             stats["fallbacks"] = tr.snapshot_fallbacks(limit=128)
-            return {"text": text, "stats": stats, "engine": "rcd"}
+            return {"text": text, "stats": stats, "engine": "rcd", "diagnostics": stats.get("rcd_diagnostics", {})}
         except HTTPException:
             raise
         except Exception as e:
@@ -2905,7 +2947,7 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
 
     # ---- OTS inference endpoint ----------------------------------------
     @app.post("/inferenceots")
-    def inferenceots(req:"_InferenceOTSRequest"):
+    def inferenceots(req: _InferenceOTSRequest):
         from .inference_ots import InferenceOTSRequest as _OTSReqSchema  # noqa: F811
         from .inference_ots import ots_decode
         from .diffusion import force_noncausal_attention
@@ -2947,6 +2989,7 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                     tau_edit=tau_e,
                     max_steps=eff_steps,
                     beam_size=req.ots_beam_size,
+                    block_size=req.ots_block_size,
                     gumbel_temperature=req.ots_gumbel_temperature,
                     search_interval=req.ots_search_interval,
                     pruning_mode=req.ots_pruning_mode,
@@ -2963,7 +3006,7 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
             stats["queue_wait_ms"] = wait_ms
             stats["serialized_inference"] = serialize_inference
             stats["fallbacks"] = tr.snapshot_fallbacks(limit=128)
-            return {"text": text, "stats": stats, "engine": "ots"}
+            return {"text": text, "stats": stats, "engine": "ots", "diagnostics": stats.get("ots_diagnostics", {})}
         except HTTPException:
             raise
         except Exception as e:
@@ -2977,6 +3020,88 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
             raise HTTPException(status_code=500, detail=str(e))
     from .inference_ots import InferenceOTSRequest as _InferenceOTSRequest  # noqa: E402
     # ---- end OTS endpoint ---------------------------------------------
+
+    # ---- S2D2 endpoint -------------------------------------------------
+    @app.post("/inferences2d2")
+    def inferences2d2(req: _InferenceS2D2Request):
+        from .inference_s2d2 import InferenceS2D2Request as _S2D2ReqSchema  # noqa: F811
+        from .inference_s2d2 import s2d2_decode
+        from .diffusion import force_noncausal_attention
+        from .inference import mode_thresholds, _resolve_effort
+        try:
+            def _do_s2d2():
+                bundle = getattr(engine, "bundle", None)
+                tokenizer = getattr(bundle, "tokenizer", None) if bundle is not None else None
+                if tokenizer is None:
+                    tokenizer = getattr(getattr(engine, "_engine", None), "tokenizer", None)
+                prompt_text = _build_prompt_from_chat(
+                    prompt=req.prompt,
+                    messages=req.messages,
+                    system_prompt=req.system_prompt,
+                    enable_thinking=req.enable_thinking,
+                    tokenizer=tokenizer,
+                )
+                if bundle is None:
+                    raise HTTPException(status_code=503, detail="Model not loaded")
+                model = bundle.model
+                device = bundle.device
+                mask_id = bundle.mask_id
+                v = bundle.vocab_size
+                is_dummy = bundle.is_dummy
+                tau_m, tau_e = mode_thresholds(engine._cfg, req.mode, req.tau_mask, req.tau_edit)
+                max_new = max(1, int(req.max_new_tokens))
+                eff_steps, tau_m, tau_e = _resolve_effort(
+                    req.effort, max(1, int(engine._cfg.inference.max_steps)), tau_m, tau_e,
+                )
+                text, stats, _diag = s2d2_decode(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    mask_id=mask_id,
+                    vocab_size=v,
+                    prompt=prompt_text,
+                    max_new_tokens=max_new,
+                    tau_mask=tau_m,
+                    tau_edit=tau_e,
+                    max_steps=eff_steps,
+                    block_size=req.s2d2_block_size,
+                    denoising_steps_per_block=req.s2d2_denoising_steps,
+                    confidence_threshold=req.s2d2_confidence_threshold,
+                    routing_policy=req.s2d2_routing_policy,
+                    min_verify_span=req.s2d2_min_verify_span,
+                    score_threshold=req.s2d2_score_threshold,
+                    score_cost=req.s2d2_score_cost,
+                    score_mode=req.s2d2_score_mode,
+                    hysteresis_on=req.s2d2_hysteresis_on,
+                    hysteresis_off=req.s2d2_hysteresis_off,
+                    acceptance_estimator=req.s2d2_acceptance_estimator,
+                    entropy_beta=req.s2d2_entropy_beta,
+                    margin_threshold=req.s2d2_margin_threshold,
+                    store_diagnostics=req.s2d2_store_diagnostics,
+                    seed=req.seed if req.seed is not None else int(engine._cfg.runtime.seed),
+                    is_dummy=is_dummy,
+                    force_noncausal_ctx=force_noncausal_attention,
+                )
+                return text, stats
+            (text, stats), wait_ms = _run_with_inference_lock(_do_s2d2)
+            stats["queue_wait_ms"] = wait_ms
+            stats["serialized_inference"] = serialize_inference
+            stats["fallbacks"] = tr.snapshot_fallbacks(limit=128)
+            return {"text": text, "stats": stats, "engine": "s2d2",
+                    "diagnostics": stats.get("s2d2_diagnostics", {})}
+        except HTTPException:
+            raise
+        except Exception as e:
+            _server_log("S2D2_REQ_ERROR", str(e), level="error", scope="S2D2")
+            if _is_oom_error(e) and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                raise HTTPException(status_code=503, detail="CUDA OOM in S2D2 inference")
+            raise HTTPException(status_code=500, detail=str(e))
+    from .inference_s2d2 import InferenceS2D2Request as _InferenceS2D2Request  # noqa: E402
+    # ---- end S2D2 endpoint ---------------------------------------------
 
     # ---- Inferenza2 hybrid endpoint ------------------------------------
     @app.post("/inferenza2")
@@ -3040,6 +3165,7 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
                     warm_start_model=None,
                     ots_enabled=ots_on,
                     beam_size=req.ots_beam_size,
+                    block_size=req.ots_block_size,
                     gumbel_temperature=req.ots_gumbel_temperature,
                     search_interval=req.ots_search_interval,
                     pruning_mode=req.ots_pruning_mode,

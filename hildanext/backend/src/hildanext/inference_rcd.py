@@ -10,6 +10,8 @@
 #      Default here falls back to the same target model (approximate).
 #   3. External inputs_embeds injection: paper's custom models have
 #      RCD-native forward(). We use HF inputs_embeds interface.
+#   4. Token update remains deterministic argmax for the selected masked
+#      positions, rather than stochastic sampling from p_i^(t_k).
 #
 # RCD residual source = probability distribution projected through the
 # model's own input embedding codebook.  NOT raw hidden states.
@@ -45,11 +47,21 @@ class InferenceRCDMRequest(BaseModel):
     # ---- RCD-specific knobs (all optional, sane defaults) ----
     rcd_alpha_mode: str = Field(default="normalized_entropy", description="normalized_entropy (Eq.3)")
     rcd_temperature_residual: float = Field(default=1.0, ge=0.01, le=10.0, description="T_res for entropy alignment (Sec 3.3)")
+    rcd_latent_logits_temperature: Optional[float] = Field(
+        default=None,
+        ge=0.01,
+        le=10.0,
+        description="Repo-style alias for latent logits temperature in RCD-LLaDA eval",
+    )
     rcd_store_step_diagnostics: bool = Field(default=True)
     rcd_force_mask_only_injection: bool = Field(default=True, description="inject residual only on [MASK] positions (Eq.2)")
     rcd_warm_start: bool = Field(default=True, description="warm-start first step (Sec 3.3)")
     rcd_reference_model: Optional[str] = Field(default=None, description="path to separate Mref checkpoint")
     rcd_same_model_warm_start_fallback: bool = Field(default=True, description="use target model if no Mref")
+    rcd_single_token_mode: Optional[bool] = Field(
+        default=None,
+        description="Force single-token-per-step decoding, matching official RCD-LLaDA eval",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +127,24 @@ def compute_normalized_entropy(probs: torch.Tensor, vocab_size: int) -> torch.Te
     entropy = -(p * p.log()).sum(dim=-1)  # H(x)
     alpha = entropy / log_v
     return alpha.clamp(0.0, 1.0)
+
+
+def _compute_alpha(
+    probs: torch.Tensor,
+    alpha_mode: str,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Compute residual interpolation weights α_i.
+
+    This implementation intentionally supports only the paper's default
+    normalized-entropy rule used in Eq. (3).
+    """
+    if alpha_mode != "normalized_entropy":
+        raise ValueError(
+            f"Unsupported rcd_alpha_mode '{alpha_mode}'. "
+            "Only 'normalized_entropy' is implemented."
+        )
+    return compute_normalized_entropy(probs, vocab_size)
 
 
 def compute_rcd_residuals_from_probs(probs: torch.Tensor, embedding_weight: torch.Tensor) -> torch.Tensor:
@@ -185,9 +215,91 @@ def initialize_rcd_warm_start(
     logits = out.logits  # (B, S, V)
     # Temperature-scaled softmax for residual probs (Sec 3.3)
     probs = F.softmax(logits.float() / max(t_res, 1e-6), dim=-1)
-    alpha_0 = compute_normalized_entropy(probs, vocab_size)
+    alpha_0 = _compute_alpha(probs, "normalized_entropy", vocab_size)
     delta_0 = compute_rcd_residuals_from_probs(probs, embedding_weight)
     return alpha_0, delta_0
+
+
+def _select_masked_positions(
+    current: torch.Tensor,
+    confidence: torch.Tensor,
+    mask_id: int,
+    tokens_per_step: int,
+    tau_mask: float,
+) -> torch.Tensor:
+    """Select up to top-m currently masked positions by confidence.
+
+    Paper-faithful core: selection is restricted to masked positions and
+    committed tokens are never reconsidered.
+
+    Compatibility behavior: `tau_mask` is treated as a soft preference.
+    If fewer than `tokens_per_step` masked positions pass the threshold,
+    the remaining slots are filled by the best remaining masked positions
+    so decoding still makes progress each step.
+    """
+    masked = current.eq(int(mask_id))
+    if not masked.any():
+        return torch.zeros_like(current, dtype=torch.bool)
+
+    k = min(int(tokens_per_step), int(masked.sum().item()))
+    if k <= 0:
+        return torch.zeros_like(current, dtype=torch.bool)
+
+    selected = torch.zeros_like(current, dtype=torch.bool)
+    score = confidence.clone()
+    score[~masked] = -float("inf")
+
+    preferred = masked & confidence.ge(float(tau_mask))
+    preferred_count = int(preferred.sum().item())
+    if preferred_count > 0:
+        pref_score = score.clone()
+        pref_score[~preferred] = -float("inf")
+        _, pref_idx = torch.topk(pref_score.view(-1), k=min(k, preferred_count), largest=True)
+        selected.view(-1)[pref_idx] = True
+
+    remaining = k - int(selected.sum().item())
+    if remaining > 0:
+        fallback_score = score.clone()
+        fallback_score[selected] = -float("inf")
+        _, top_idx = torch.topk(fallback_score.view(-1), k=remaining, largest=True)
+        selected.view(-1)[top_idx] = True
+
+    return selected
+
+
+def _commit_selected_tokens(
+    current: torch.Tensor,
+    pred_ids: torch.Tensor,
+    selected: torch.Tensor,
+) -> torch.Tensor:
+    """Commit predictions only on the selected masked positions."""
+    updated = current.clone()
+    if selected.any():
+        updated[selected] = pred_ids[selected]
+    return updated
+
+
+def _looks_like_llada_model(model: Any, tokenizer: Any = None) -> bool:
+    """Best-effort heuristic to detect LLaDA-family models.
+
+    The official RCD repo evaluates LLaDA with single-token-per-step
+    decoding and `steps=max_new_tokens`. We mirror that behavior when
+    the loaded model appears to be LLaDA-derived.
+    """
+    candidates: List[str] = []
+
+    for obj in (model, getattr(model, "config", None), tokenizer):
+        if obj is None:
+            continue
+        for attr in ("name_or_path", "_name_or_path", "model_type"):
+            value = getattr(obj, attr, None)
+            if isinstance(value, str) and value:
+                candidates.append(value.lower())
+        cls_name = obj.__class__.__name__
+        if isinstance(cls_name, str):
+            candidates.append(cls_name.lower())
+
+    return any("llada" in item for item in candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +319,12 @@ def rcd_decode(
     tau_edit: float = 0.5,
     max_steps: int = 10,
     t_res: float = 1.0,
+    latent_logits_temperature: Optional[float] = None,
     alpha_mode: str = "normalized_entropy",
     force_mask_only: bool = True,
     warm_start: bool = True,
     warm_start_model: Any = None,
+    single_token_mode: Optional[bool] = None,
     store_diagnostics: bool = True,
     seed: int = 42,
     is_dummy: bool = False,
@@ -219,13 +333,17 @@ def rcd_decode(
     """Full RCD inference loop (Algorithm 2).
     Returns: (text, stats_dict, diagnostics).
     """
-    from .formulas import llada21_apply
-    from .diffusion import apply_remask
-    from .config import RemaskConfig
     from .utils import seed_everything, tokens_per_second
 
+    resolved_t_res = float(latent_logits_temperature) if latent_logits_temperature is not None else float(t_res)
     seed_everything(seed)
-    diag = RCDInferenceDiagnostics(t_res=t_res)
+    diag = RCDInferenceDiagnostics(t_res=resolved_t_res)
+
+    if alpha_mode != "normalized_entropy":
+        raise ValueError(
+            f"Unsupported rcd_alpha_mode '{alpha_mode}'. "
+            "Only 'normalized_entropy' is implemented."
+        )
 
     # Encode prompt
     enc = tokenizer([prompt], return_tensors="pt")
@@ -240,13 +358,26 @@ def rcd_decode(
     embed_layer = _get_embedding_layer(model)
     embed_weight = embed_layer.weight.detach()  # (V, D) — the codebook E
 
-    # Clamp vocab_size to embedding table size
+    # Use the target model's embedding-table size as the effective
+    # vocabulary for Eq. (1) and Eq. (3). This keeps entropy and
+    # residual projection in the same token space as the target model.
     actual_v = embed_weight.shape[0]
-    effective_v = min(vocab_size, actual_v)
+    effective_v = actual_v
+    if single_token_mode is None:
+        llada_single_token_mode = _looks_like_llada_model(model, tokenizer)
+    else:
+        llada_single_token_mode = bool(single_token_mode)
+    effective_steps = max(1, int(max_steps))
+    if llada_single_token_mode:
+        # Official RCD-LLaDA evaluation uses single-token-per-step
+        # decoding with steps matched to max_new_tokens.
+        effective_steps = max(effective_steps, int(max_new_tokens))
+        tokens_per_step = 1
+    else:
+        tokens_per_step = max(1, int(_math.ceil(max_new_tokens / effective_steps)))
 
     # Initialize residual state buffers
     S = seq.shape[1]
-    D = embed_weight.shape[1]
     alpha_prev = torch.zeros(1, S, device=device, dtype=torch.float32)
     delta_prev = embed_layer(seq).detach()  # initialize to base embeddings
 
@@ -256,12 +387,11 @@ def rcd_decode(
     if warm_start:
         alpha_prev, delta_prev = initialize_rcd_warm_start(
             ws_model, seq, mask_id, embed_weight, effective_v,
-            t_res=t_res, force_noncausal_ctx=force_noncausal_ctx,
+            t_res=resolved_t_res, force_noncausal_ctx=force_noncausal_ctx,
         )
         diag.warm_start_used = True
         diag.reference_model_used = reference_model_used
 
-    remask_cfg = RemaskConfig()
     model.eval()
     t0 = time.time()
     converged = False
@@ -276,7 +406,7 @@ def rcd_decode(
     eos_cut_idx: Optional[int] = None
 
     with torch.inference_mode():
-        for step in range(max_steps):
+        for step in range(effective_steps):
             step_t0 = time.time()
 
             # ---- Build input embeddings with RCD residuals (Eq.2) ----
@@ -300,26 +430,23 @@ def rcd_decode(
             confidence, pred_ids = gen_probs.max(dim=-1)  # (B, S_gen)
 
             gen_before = seq[:, prompt_len:]
-            masked_before = gen_before.eq(mask_id)
-
-            # ---- Selection + Update via existing llada21_apply ----
-            updated, sets = llada21_apply(
-                gen_before, pred_ids, confidence,
-                mask_id, tau_mask, tau_edit,
+            selected = _select_masked_positions(
+                gen_before,
+                confidence,
+                mask_id,
+                tokens_per_step,
+                tau_mask,
             )
-
-            # Remask on non-final steps
-            if step + 1 < max_steps:
-                updated = apply_remask(updated, confidence, mask_id, remask_cfg)
+            updated = _commit_selected_tokens(gen_before, pred_ids, selected)
 
             seq[:, prompt_len:] = updated
 
             # ---- Compute new residual state for next step (Algorithm 2, lines 22-26) ----
             # Use temperature-scaled probs for entropy alignment (Sec 3.3)
             full_logits = logits  # (B, S, V)
-            res_probs = F.softmax(full_logits.float() / max(t_res, 1e-6), dim=-1)
+            res_probs = F.softmax(full_logits.float() / max(resolved_t_res, 1e-6), dim=-1)
             # α from temperature-scaled distribution (Eq.3 + Sec 3.3)
-            alpha_prev = compute_normalized_entropy(res_probs, effective_v)
+            alpha_prev = _compute_alpha(res_probs, alpha_mode, effective_v)
             # Δ from original probs projected through codebook (Eq.1)
             # Paper uses p_{i,j}^{t_k} (not temperature-scaled) for the residual vector
             orig_probs = F.softmax(full_logits.float(), dim=-1)
@@ -327,7 +454,7 @@ def rcd_decode(
 
             # ---- Diagnostics ----
             remain = int(updated.eq(mask_id).sum().item())
-            committed = int(sets.gamma_count) + int(sets.delta_count)
+            committed = int(selected.sum().item())
             step_elapsed = (time.time() - step_t0) * 1000.0
 
             if store_diagnostics:
@@ -353,11 +480,9 @@ def rcd_decode(
                     break
 
             if remain == 0:
-                if sets.delta_count == 0:
-                    finish_reason = "converged"
-                    converged = True
-                    break
                 finish_reason = "converged"
+                converged = True
+                break
 
     elapsed = max(1e-6, time.time() - t0)
     out_ids = seq[0, prompt_len:]
@@ -382,6 +507,8 @@ def rcd_decode(
         "steps": len(diag.steps),
         "tokens_generated": tokens_generated,
         "tokens_per_sec": tokens_per_second(tokens_generated, elapsed),
+        "t_res": resolved_t_res,
+        "latent_logits_temperature": resolved_t_res,
         "finish_reason": finish_reason,
         "truncated": finish_reason == "length",
         "dummy_model": is_dummy,

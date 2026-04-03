@@ -21,14 +21,13 @@
 #   - The codebase is full-sequence bidirectional (not semi-AR block
 #     diffusion).  We simulate "blocks" by grouping denoising steps
 #     into checkpoint intervals of `search_interval` steps.
-#   - Confidence-based token transfer reuses existing llada21_apply
-#     for each denoising micro-step within a block.
+#   - Within each simulated block we denoise only the positions selected
+#     at the block boundary, then score/prune at the end of the interval.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-import copy
 import time
-import math as _math
+import math
 import torch
 import torch.nn.functional as F
 from pydantic import BaseModel, Field
@@ -57,6 +56,7 @@ class InferenceOTSRequest(BaseModel):
     ots_beam_size: int = Field(default=3, ge=1, le=32, description="K — number of beams")
     ots_gumbel_temperature: float = Field(default=0.6, ge=0.0, le=5.0, description="τ for Gumbel noise (Alg.1)")
     ots_search_interval: int = Field(default=0, ge=0, le=256, description="N steps between search checkpoints; 0=auto")
+    ots_block_size: int = Field(default=32, ge=1, le=512, description="Contiguous block size (paper default 32, Alg.1 block_idx)")
     ots_pruning_mode: str = Field(default="diffusion_likelihood", description="diffusion_likelihood | fallback_confidence")
     ots_store_search_trace: bool = Field(default=True)
     ots_return_diagnostics: bool = Field(default=True)
@@ -133,6 +133,16 @@ class OTSBeamState:
     step: int = 0
     # Lightweight trace: list of (step, positions_revealed) per checkpoint
     reveal_trace: List[Tuple[int, int]] = field(default_factory=list)
+    # Positions that have already been scored and should stay fixed.
+    committed_mask: Optional[torch.Tensor] = None
+    # Positions currently being denoised inside the active block.
+    current_block_mask: Optional[torch.Tensor] = None
+    # Model's full prediction from x_t (parent, pre-expansion) with Gumbel
+    # noise, stored for Eq.(2) scoring.  Avoids re-running the model on x_s.
+    x0_for_scoring: Optional[torch.Tensor] = None
+    # Index of the contiguous block currently being processed (Alg.1 line 8).
+    # Advances by 1 after each scored checkpoint.
+    block_idx: int = 0
 
 
 def clone_search_state(state: OTSBeamState) -> OTSBeamState:
@@ -143,7 +153,29 @@ def clone_search_state(state: OTSBeamState) -> OTSBeamState:
         block_scores=list(state.block_scores),
         step=state.step,
         reveal_trace=list(state.reveal_trace),
+        committed_mask=(
+            state.committed_mask.clone() if state.committed_mask is not None else None
+        ),
+        current_block_mask=(
+            state.current_block_mask.clone() if state.current_block_mask is not None else None
+        ),
+        x0_for_scoring=(
+            state.x0_for_scoring.clone() if state.x0_for_scoring is not None else None
+        ),
+        block_idx=state.block_idx,
     )
+
+
+def _zero_mask_like(seq: torch.Tensor) -> torch.Tensor:
+    return torch.zeros_like(seq, dtype=torch.bool)
+
+
+def _ensure_beam_masks(state: OTSBeamState) -> None:
+    if state.committed_mask is None:
+        state.committed_mask = _zero_mask_like(state.seq)
+        state.committed_mask[:, :state.prompt_len] = True
+    if state.current_block_mask is None:
+        state.current_block_mask = _zero_mask_like(state.seq)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +238,75 @@ def _forward_model(
     return out.logits
 
 
+def _denoise_active_block_step(
+    current: torch.Tensor,
+    x0: torch.Tensor,
+    confidence: torch.Tensor,
+    active_mask: torch.Tensor,
+    mask_id: int,
+    tau_mask: float,
+    tau_edit: float,
+) -> torch.Tensor:
+    """Denoise only positions that belong to the current active block."""
+    out = current.clone()
+    active = active_mask.bool()
+    if not active.any():
+        return out
+
+    reveal = active & current.eq(mask_id) & confidence.ge(float(tau_mask))
+    if reveal.any():
+        out[reveal] = x0[reveal]
+
+    edit = active & current.ne(mask_id) & x0.ne(current) & confidence.ge(float(tau_edit))
+    if edit.any():
+        out[edit] = x0[edit]
+
+    return out
+
+
+def _apply_block_remask(
+    tokens: torch.Tensor,
+    confidence: torch.Tensor,
+    active_mask: torch.Tensor,
+    mask_id: int,
+    target_ratio: float,
+    min_ratio: float,
+) -> torch.Tensor:
+    """Low-confidence remasking restricted to the active block."""
+    out = tokens.clone()
+    candidate = active_mask & out.ne(mask_id)
+    total = int(candidate.sum().item())
+    if total <= 0:
+        return out
+
+    k = max(int(total * float(min_ratio)), int(total * float(target_ratio)))
+    if k <= 0:
+        return out
+
+    score = confidence.clone()
+    score[~candidate] = 2.0
+    flat = score.view(-1)
+    k = min(k, int(candidate.sum().item()))
+    if k <= 0:
+        return out
+
+    _, idx = torch.topk(flat, k=k, largest=False)
+    out.view(-1)[idx] = mask_id
+    return out
+
+
+def _build_x0_full(
+    model: Any,
+    beam: OTSBeamState,
+    force_noncausal_ctx: Any = None,
+) -> torch.Tensor:
+    """Model full prediction x0 for the current partial sequence."""
+    logits = _forward_model(model, beam.seq, force_noncausal_ctx)
+    x0_full = beam.seq.clone()
+    x0_full[:, beam.prompt_len:] = logits[:, beam.prompt_len:, :].argmax(dim=-1)
+    return x0_full
+
+
 def score_ots_candidate(
     model: Any,
     candidate_state: OTSBeamState,
@@ -247,10 +348,14 @@ def score_ots_candidate(
     with torch.inference_mode():
         score_logits = _forward_model(model, score_input, force_noncausal_ctx)
 
-    # Log-prob of actual tokens at newly revealed positions
+    # Log-prob of actual tokens at newly revealed positions.
+    # USE x0_full as targets (paper Eq.(2): log p_θ(x0 | b(xs,xt,x0))).
+    # x0_full is the Gumbel-sampled full prediction from x_t; it has
+    # definite (non-MASK) tokens at every position including those not
+    # yet committed in x_s.  Using candidate_state.seq would give MASK
+    # as the target for uncommitted block positions, distorting scores.
     log_probs = F.log_softmax(score_logits.float(), dim=-1)  # (B, S, V)
-    # Get the token ids at the revealed positions from the candidate
-    target_ids = candidate_state.seq[newly_revealed]  # (n_revealed,)
+    target_ids = x0_full[newly_revealed]  # (n_revealed,)  ← x0, not x_s
     # Gather log probs
     revealed_idx = newly_revealed.nonzero(as_tuple=False)  # (n_revealed, 2)
     score_sum = 0.0
@@ -266,7 +371,7 @@ def score_ots_candidate_fallback(
     confidence: torch.Tensor,
     newly_revealed: torch.Tensor,
 ) -> float:
-    """Fallback scoring: mean confidence of newly revealed tokens.
+    """Fallback scoring: summed confidence of newly revealed tokens.
     APPROXIMATION: this is NOT paper-faithful.  It's a simple proxy
     when the dedicated diffusion-native score is unavailable/disabled."""
     n = int(newly_revealed.sum().item())
@@ -280,17 +385,19 @@ def expand_ots_candidates(
     beam: OTSBeamState,
     beam_size: int,
     mask_id: int,
-    tokens_per_step: int,
+    block_size: int,
     gumbel_temp: float,
     force_noncausal_ctx: Any = None,
 ) -> List[Tuple[OTSBeamState, torch.Tensor, torch.Tensor]]:
     """Expand one beam into `beam_size` child candidates.
     Each child is produced by sampling x0 with independent Gumbel noise
-    (Alg.1 lines 9-12), which varies BOTH the predicted tokens AND
-    the confidence ranking (and thus which positions get committed).
-    This is the joint order-token exploration step.
+    (Alg.1 lines 9-12).  Token filling is restricted to the CURRENT
+    CONTIGUOUS BLOCK (beam.block_idx * block_size .. +block_size), making
+    the generation order structured and semi-AR compatible (Alg.1 line 8).
+    Scoring uses ALL positions in that block against x_full_seq (Alg.1
+    lines 13-15, Eq.(2)).
 
-    Returns: list of (child_state, newly_revealed_mask, x0_full)
+    Returns: list of (child_state, block_mask_full, x0_full)
     """
     children = []
     seq = beam.seq
@@ -308,23 +415,50 @@ def expand_ots_candidates(
         conf = F.softmax(noisy.float(), dim=-1).max(dim=-1).values  # (1, gen_len)
 
         child = clone_search_state(beam)
-        gen_before = child.seq[:, prompt_len:]
+        gen_len_local = seq.shape[1] - prompt_len
 
-        # Transfer tokens: reveals top-confidence positions (joint order-token)
-        updated, revealed_gen = _transfer_tokens(
-            gen_before, x0_gen, conf, mask_id, tokens_per_step,
-        )
+        # Current contiguous block boundaries in gen space (Alg.1 line 8).
+        blk_s = min(beam.block_idx * block_size, gen_len_local)
+        blk_e = min(blk_s + block_size, gen_len_local)
+
+        # x_candidate (Alg.1 line 12): fill only the current block's positions.
+        # This enforces semi-AR generation order — earlier blocks are context,
+        # later blocks are untouched until their turn.
+        gen_before = child.seq[:, prompt_len:]
+        if blk_s < blk_e:
+            gen_blk = gen_before[:, blk_s:blk_e]
+            updated_blk, _ = _transfer_tokens(
+                gen_blk,
+                x0_gen[:, blk_s:blk_e],
+                conf[:, blk_s:blk_e],
+                mask_id,
+                block_size,
+            )
+            updated = gen_before.clone()
+            updated[:, blk_s:blk_e] = updated_blk
+        else:
+            updated = gen_before.clone()
         child.seq[:, prompt_len:] = updated
 
-        # Build full revealed mask (including prompt dim for scoring)
-        full_revealed = torch.zeros_like(child.seq, dtype=torch.bool)
-        full_revealed[:, prompt_len:] = revealed_gen
+        # current_block_mask = the FULL contiguous block slice (Alg.1 line 14:
+        # x_masked ← mask_tokens(x_full_seq, block_idx)), not sparse positions.
+        # This is the structured change of point 5.
+        block_mask_full = torch.zeros_like(child.seq, dtype=torch.bool)
+        if blk_s < blk_e:
+            block_mask_full[:, prompt_len + blk_s: prompt_len + blk_e] = True
+        child.current_block_mask = block_mask_full
 
-        # Build x0_full for scoring: prompt tokens + predicted gen tokens
-        x0_full = child.seq.clone()
-        x0_full[:, prompt_len:] = x0_gen  # model's full prediction
+        # x0_full = x_full_seq (Alg.1 line 13): start from x_t, fill ALL
+        # remaining masked gen positions with Gumbel-sampled x0_gen.
+        # Conditioning on x_t (not x_s) keeps scoring faithful to Eq.(2).
+        x0_full = beam.seq.clone()                          # x_t
+        gen_is_mask_xt = beam.seq[:, prompt_len:].eq(mask_id)
+        x0_gen_fill = x0_full[:, prompt_len:].clone()
+        x0_gen_fill[gen_is_mask_xt] = x0_gen[gen_is_mask_xt]
+        x0_full[:, prompt_len:] = x0_gen_fill
+        child.x0_for_scoring = x0_full  # Alg.1 line 13; used in score_block
 
-        children.append((child, full_revealed, x0_full))
+        children.append((child, block_mask_full, x0_full))
 
     return children
 
@@ -357,6 +491,7 @@ def ots_decode(
     tau_edit: float = 0.5,
     max_steps: int = 10,
     beam_size: int = 3,
+    block_size: int = 32,
     gumbel_temperature: float = 0.6,
     search_interval: int = 0,
     pruning_mode: str = "diffusion_likelihood",
@@ -368,19 +503,15 @@ def ots_decode(
 ) -> Tuple[str, Dict[str, Any], OTSSearchDiagnostics]:
     """Full Order-Token Search decode loop.
 
-    Structure (following paper Alg.1):
-    1. Initialize K identical beams from [prompt; MASK^L]
-    2. For each denoising step:
-       a) If step is a search checkpoint (step % N == 0):
-          - Expand each beam into K children via Gumbel-noise sampling
-          - Score each child with diffusion-native likelihood (Eq.2)
-          - Prune to top-K by cumulative score
-       b) Otherwise: standard denoising step (low-confidence remasking)
-    3. Return best beam.
+    Approximate OTS structure:
+    1. Start from a single masked root trajectory.
+    2. At each block boundary, expand every live beam via Gumbel-noise
+       sampling to choose the next block positions.
+    3. Denoise only that active block for `search_interval` micro-steps.
+    4. Score the finished block with the diffusion-native scorer (Eq.2),
+       add it to the cumulative trajectory score, then prune to top-K.
+    5. Return the best surviving beam.
     """
-    from .formulas import llada21_apply
-    from .diffusion import apply_remask
-    from .config import RemaskConfig
     from .utils import seed_everything, tokens_per_second
 
     seed_everything(seed)
@@ -415,24 +546,23 @@ def ots_decode(
     # Search interval: paper uses block_size=32 as default.
     # We use steps-per-block equivalent since codebase is full-sequence.
     if search_interval <= 0:
-        # Auto: search every ceil(max_steps / max(4, gen_len//32)) steps
-        n_blocks = max(2, gen_len // 32)
+        # Auto: one checkpoint per block (paper: N = S/B steps per block).
+        n_blocks = max(2, gen_len // max(1, block_size))
         search_interval = max(1, max_steps // n_blocks)
-    tokens_per_step_base = max(1, gen_len // max(1, max_steps))
 
-    # Initialize K identical beams (Alg.1 line 2)
-    beams: List[OTSBeamState] = []
-    for _ in range(beam_size):
-        beams.append(OTSBeamState(
-            seq=init_seq.clone(),
-            prompt_len=prompt_len,
-        ))
+    # Keep a single root beam, then branch at each block boundary.
+    root = OTSBeamState(
+        seq=init_seq.clone(),
+        prompt_len=prompt_len,
+    )
+    _ensure_beam_masks(root)
+    beams: List[OTSBeamState] = [root]
 
-    remask_cfg = RemaskConfig()
     model.eval()
     t0 = time.time()
     checkpoint_idx = 0
     total_expansions = 0
+    steps_run = 0
 
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     if eos_token_id is not None:
@@ -444,98 +574,130 @@ def ots_decode(
     finish_reason = "length"
 
     with torch.inference_mode():
-        for step in range(max_steps):
-            is_search_checkpoint = (step > 0 and step % search_interval == 0)
+        for block_start in range(0, max_steps, search_interval):
+            block_end = min(max_steps, block_start + search_interval)
+            ckpt_t0 = time.time()
+            n_before = len(beams)
+            all_candidates: List[OTSBeamState] = []
+            child_count = max(1, beam_size)
 
-            if is_search_checkpoint and beam_size > 1:
-                # ---- SEARCH CHECKPOINT: expand + score + prune ----
-                ckpt_t0 = time.time()
-                all_candidates: List[OTSBeamState] = []
-                n_before = len(beams)
+            # Expand at the start of each block, then denoise the active block.
+            for beam in beams:
+                children = expand_ots_candidates(
+                    model, beam, child_count, mask_id,
+                    block_size, gumbel_temperature,
+                    force_noncausal_ctx,
+                )
+                for child, _revealed, _x0_full in children:
+                    _ensure_beam_masks(child)
+                    all_candidates.append(child)
 
-                for beam in beams:
-                    children = expand_ots_candidates(
-                        model, beam, beam_size, mask_id,
-                        tokens_per_step_base, gumbel_temperature,
+            total_expansions += len(all_candidates)
+            if not all_candidates:
+                break
+
+            work_beams = all_candidates
+            for step in range(block_start, block_end):
+                next_beams: List[OTSBeamState] = []
+                for beam in work_beams:
+                    gen_before = beam.seq[:, prompt_len:]
+                    gen_len_local = gen_before.shape[1]
+                    # Current block boundaries (same block as the expansion).
+                    blk_s = min(beam.block_idx * block_size, gen_len_local)
+                    blk_e = min(blk_s + block_size, gen_len_local)
+                    if blk_s < blk_e and gen_before[:, blk_s:blk_e].eq(mask_id).any():
+                        # Alg.1 else-branch (lines 23-26): Gumbel-sampled step
+                        # restricted to the CURRENT block (semi-AR compatible).
+                        # Only fills positions within [blk_s, blk_e) in gen space.
+                        logits = _forward_model(model, beam.seq, force_noncausal_ctx)
+                        gen_logits = logits[:, prompt_len:, :]
+                        noisy = _add_gumbel_noise(gen_logits, gumbel_temperature)
+                        x0_gen = noisy.argmax(dim=-1)
+                        conf = F.softmax(noisy.float(), dim=-1).max(dim=-1).values
+                        gen_blk = gen_before[:, blk_s:blk_e]
+                        updated_blk, _ = _transfer_tokens(
+                            gen_blk, x0_gen[:, blk_s:blk_e],
+                            conf[:, blk_s:blk_e], mask_id, block_size,
+                        )
+                        updated = gen_before.clone()
+                        updated[:, blk_s:blk_e] = updated_blk
+                        beam.seq[:, prompt_len:] = updated
+                    beam.step = step
+                    next_beams.append(beam)
+
+                work_beams = next_beams
+                steps_run = max(steps_run, step + 1)
+
+            # Score the completed active block, then prune.
+            for beam in work_beams:
+                _ensure_beam_masks(beam)
+                # score_mask = the FULL contiguous block (Alg.1 lines 14-15).
+                # Do NOT filter by seq.ne(mask_id): x0_full fills all positions
+                # so even uncommitted block positions have valid scoring targets.
+                score_mask = (
+                    beam.current_block_mask.clone()
+                    if beam.current_block_mask is not None
+                    else _zero_mask_like(beam.seq)
+                )
+                score_mask[:, :prompt_len] = False
+
+                if use_diffusion_score:
+                    # Use x0 sampled from x_t with Gumbel noise (stored in
+                    # expand_ots_candidates) — this is the correct conditioning
+                    # input for Eq.(2): E[x0 ~ p_θ(x0|x_t)], NOT p_θ(x0|x_s).
+                    x0_full = (
+                        beam.x0_for_scoring
+                        if beam.x0_for_scoring is not None
+                        else _build_x0_full(model, beam, force_noncausal_ctx)
+                    )
+                    block_score = score_ots_candidate(
+                        model,
+                        beam,
+                        score_mask,
+                        x0_full,
+                        mask_id,
                         force_noncausal_ctx,
                     )
-                    for child, revealed, x0_full in children:
-                        # Score the child
-                        if use_diffusion_score:
-                            block_score = score_ots_candidate(
-                                model, child, revealed, x0_full,
-                                mask_id, force_noncausal_ctx,
-                            )
-                        else:
-                            gen_logits = _forward_model(
-                                model, beam.seq, force_noncausal_ctx,
-                            )[:, prompt_len:, :]
-                            conf = F.softmax(gen_logits.float(), dim=-1).max(dim=-1).values
-                            full_conf = torch.zeros(1, child.seq.shape[1], device=device)
-                            full_conf[:, prompt_len:] = conf
-                            block_score = score_ots_candidate_fallback(
-                                child, full_conf, revealed,
-                            )
-
-                        child.block_scores.append(block_score)
-                        child.cumulative_score = sum(child.block_scores)
-                        child.step = step
-
-                        n_revealed = int(revealed.sum().item())
-                        child.reveal_trace.append((step, n_revealed))
-                        all_candidates.append(child)
-
-                total_expansions += len(all_candidates)
-
-                # Prune to top-K (Alg.1 line 21)
-                beams = prune_ots_beams(all_candidates, beam_size)
-
-                ckpt_elapsed = (time.time() - ckpt_t0) * 1000.0
-                if store_trace:
-                    diag.checkpoints.append(OTSCheckpointDiag(
-                        checkpoint_idx=checkpoint_idx,
-                        step_range=(max(0, step - search_interval), step),
-                        beams_before_expand=n_before,
-                        candidates_after_expand=len(all_candidates),
-                        beams_after_prune=len(beams),
-                        scores=[b.cumulative_score for b in beams],
-                        masked_remaining=[
-                            int(b.seq[:, prompt_len:].eq(mask_id).sum().item())
-                            for b in beams
-                        ],
-                        elapsed_ms=ckpt_elapsed,
-                    ))
-                checkpoint_idx += 1
-
-            else:
-                # ---- REGULAR DENOISING STEP (Alg.1 lines 23-27) ----
-                # Each beam independently denoises one step using the
-                # standard low-confidence remasking strategy.
-                new_beams = []
-                for beam in beams:
-                    logits = _forward_model(
-                        model, beam.seq, force_noncausal_ctx,
-                    )
-                    gen_logits = logits[:, prompt_len:, :]
-                    noisy = _add_gumbel_noise(gen_logits, gumbel_temperature)
-                    x0_gen = noisy.argmax(dim=-1)
-                    conf = F.softmax(gen_logits.float(), dim=-1).max(dim=-1).values
-
-                    gen_before = beam.seq[:, prompt_len:]
-                    updated, sets = llada21_apply(
-                        gen_before, x0_gen, conf, mask_id, tau_mask, tau_edit,
+                else:
+                    logits = _forward_model(model, beam.seq, force_noncausal_ctx)
+                    conf = F.softmax(logits[:, prompt_len:, :].float(), dim=-1).max(dim=-1).values
+                    full_conf = torch.zeros(1, beam.seq.shape[1], device=device)
+                    full_conf[:, prompt_len:] = conf
+                    block_score = score_ots_candidate_fallback(
+                        beam,
+                        full_conf,
+                        score_mask,
                     )
 
-                    # Remask on non-final steps
-                    if step + 1 < max_steps:
-                        updated = apply_remask(updated, conf, mask_id, remask_cfg)
+                beam.block_scores.append(block_score)
+                beam.cumulative_score += block_score
+                beam.reveal_trace.append((block_end - 1, int(score_mask.sum().item())))
+                beam.committed_mask |= score_mask
+                beam.current_block_mask = _zero_mask_like(beam.seq)
+                # Advance to next contiguous block (Alg.1: block_idx increments
+                # as each block boundary is processed).
+                beam.block_idx += 1
 
-                    beam.seq[:, prompt_len:] = updated
-                    beam.step = step
-                    new_beams.append(beam)
-                beams = new_beams
+            beams = prune_ots_beams(work_beams, beam_size)
 
-            # Check early stop on all beams
+            ckpt_elapsed = (time.time() - ckpt_t0) * 1000.0
+            if store_trace:
+                diag.checkpoints.append(OTSCheckpointDiag(
+                    checkpoint_idx=checkpoint_idx,
+                    step_range=(block_start, block_end),
+                    beams_before_expand=n_before,
+                    candidates_after_expand=len(all_candidates),
+                    beams_after_prune=len(beams),
+                    scores=[b.cumulative_score for b in beams],
+                    masked_remaining=[
+                        int(b.seq[:, prompt_len:].eq(mask_id).sum().item())
+                        for b in beams
+                    ],
+                    elapsed_ms=ckpt_elapsed,
+                ))
+            checkpoint_idx += 1
+
+            # Check early stop after each scored block.
             any_alive = False
             for beam in beams:
                 gen = beam.seq[:, prompt_len:]
@@ -553,8 +715,6 @@ def ots_decode(
                 break
 
     # ---- Select best beam (Alg.1 line 30) ----
-    # Final scoring: run one more diffusion-likelihood pass on fully
-    # denoised beams if they haven't been scored at the last checkpoint
     best_idx = 0
     best_score = beams[0].cumulative_score if beams else 0.0
     for i, b in enumerate(beams):
@@ -575,10 +735,10 @@ def ots_decode(
     tokens_generated = int((out_ids != mask_id).sum().item())
     text = _decode_text_ots(tokenizer, out_ids, mask_id, is_dummy)
 
-    diag.total_beams_explored = total_expansions + beam_size
+    diag.total_beams_explored = total_expansions + 1
     diag.chosen_beam_index = best_idx
     diag.chosen_beam_score = best_score
-    diag.total_denoising_steps = max_steps
+    diag.total_denoising_steps = steps_run
     diag.total_search_checkpoints = checkpoint_idx
     diag.total_elapsed_ms = elapsed * 1000.0
     diag.finish_reason = finish_reason
@@ -592,6 +752,7 @@ def ots_decode(
         "gumbel_temperature": gumbel_temperature,
         "search_interval": search_interval,
         "steps": max_steps,
+        "block_size": block_size,
         "tokens_generated": tokens_generated,
         "tokens_per_sec": tokens_per_second(tokens_generated, elapsed),
         "finish_reason": finish_reason,
