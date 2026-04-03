@@ -551,6 +551,11 @@ def ots_decode(
 
     # Search interval: paper uses block_size=32 as default.
     # We use steps-per-block equivalent since codebase is full-sequence.
+    #
+    # Paper Appendix A.5.1: "gen_len = 2 × diffusion_steps; block_size = 32"
+    # Always enforce proportional steps so tokens_per_step ≈ 2 (paper default).
+    max_steps = max(max_steps, gen_len // 2)
+
     if search_interval <= 0:
         # Auto: one checkpoint per block (paper: N = S/B steps per block).
         n_blocks = max(2, gen_len // max(1, block_size))
