@@ -128,6 +128,7 @@ class LoadWeightsRequest(BaseModel):
     max_new_tokens:int=Field(default=1,ge=1,le=8)
     seed:Optional[int]=None
     effort:str=Field(default="instant",description="instant|low|medium|high|adaptive")
+    model_override:Optional[str]=Field(default=None,description="Relative path from hildanext root to model dir, e.g. runs/checkpoints/cpt/step_04000")
 
 
 class HellaSwagItemRequest(BaseModel):
@@ -1189,10 +1190,18 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
         mask_ratio=_f(row.get("mask_ratio",0.0))
         gamma=int(row.get("gamma_count",0))
         delta=int(row.get("delta_count",0))
+        decode_policy=str(row.get("decode_policy","") or "")
+        noop_reason=str(row.get("noop_reason","") or "")
         msg=(
             f"step={step} mask_ratio={mask_ratio:.4f} gamma={gamma} delta={delta} "
             f"tau_mask={_f(row.get('tau_mask',0.0)):.4f} tau_edit={_f(row.get('tau_edit',0.0)):.4f}"
         )
+        if decode_policy:
+            msg+=f" policy={decode_policy}"
+        if bool(row.get("low_conf_fallback_applied",False)):
+            msg+=f" fallback={int(row.get('low_conf_fallback_count',0) or 0)}"
+        if noop_reason:
+            msg+=f" noop={noop_reason}"
         meta={
             "step":step,
             "mask_ratio":mask_ratio,
@@ -1204,6 +1213,41 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
             "tau_edit":row.get("tau_edit"),
             "prompt_preview":ctx.get("prompt_preview",""),
         }
+        for extra_key in [
+            "decode_policy",
+            "use_bidirectional_effective",
+            "tau_mask_active",
+            "tau_edit_active",
+            "delta_edit_enabled",
+            "remask_enabled",
+            "eligible_gamma_count",
+            "applied_gamma_count",
+            "eligible_delta_count",
+            "applied_delta_count",
+            "remask_applied",
+            "remask_count",
+            "low_conf_fallback_applied",
+            "low_conf_fallback_count",
+            "delta_stage_ready",
+            "delta_gate_reason",
+            "accept_strategy",
+            "block_mask_ratio_before",
+            "dominant_token",
+            "dominant_token_share",
+            "topk_tokens",
+            "noop_reason",
+            "tau_fallback_applied",
+            "tau_mask_next",
+            "tau_edit_next",
+            "budget",
+            "step_in_block",
+            "block_start",
+            "block_end",
+            "changed_count",
+            "progress_count",
+        ]:
+            if extra_key in row:
+                meta[extra_key]=row.get(extra_key)
         if row.get("stop_guard_reason"):
             meta["stop_guard_reason"]=row.get("stop_guard_reason")
             meta["stop_guard_triggered"]=bool(row.get("stop_guard_triggered"))
@@ -1813,6 +1857,20 @@ def create_app(cfg:AppConfig,config_path:str="")->FastAPI:
         from .ar import generate_ar_from_bundle as _generate_ar_bundle
         from .ar import generate_ar as _generate_ar_slow
         _ensure_cuda_for_inference()
+
+        # ---- model_override: switch model dir if FE requests a different checkpoint ----
+        if req.model_override:
+            from pathlib import Path as _P
+            root=_P(cfg.paths.root)
+            candidate=root/req.model_override
+            if not candidate.is_dir():
+                raise HTTPException(status_code=400,detail=f"model_override path not found: {candidate}")
+            new_dir=str(candidate.resolve())
+            cur_dir=str(_P(cfg.paths.model_dir).resolve())
+            if new_dir!=cur_dir:
+                _server_log("MODEL_SWITCH",f"old={cur_dir} new={new_dir}",scope="LOAD")
+                cfg.paths.model_dir=new_dir
+                engine.close()  # unload current model so _ensure() reloads with new path
 
         scope=(req.scope or "BOTH").upper()
         _server_log(

@@ -48,7 +48,7 @@ class WSDConfig:
     stable_steps:int=300
     decay_steps:int=100
     start_block_size:int=1
-    max_block_size:int=512
+    max_block_size:int=1024
     end_block_size:int=32
     ladder_blocks:List[int]=field(default_factory=list)
     decay_blocks:List[int]=field(default_factory=list)
@@ -106,8 +106,8 @@ class Stage0Config:
     warmup_frac:float=0.2
     stable_frac:float=0.6
     decay_frac:float=0.2
-    ladder_blocks:List[int]=field(default_factory=lambda:[1,4,32,64,256])
-    decay_blocks:List[int]=field(default_factory=lambda:[256,128,64,32])
+    ladder_blocks:List[int]=field(default_factory=lambda:[1,4,32,64,128,256,512,1024])
+    decay_blocks:List[int]=field(default_factory=lambda:[1024,512,256,128,64,32])
     doc_packing:bool=True
     doc_attention_mask_mode:str="composite_llada20"
 
@@ -135,9 +135,9 @@ class InferenceConfig:
     s_mode_tau_edit:float=0.08
     q_mode_tau_mask:float=0.18
     q_mode_tau_edit:float=0.16
-    max_steps:int=10
+    max_steps:int=64
     max_new_tokens:int=96
-    block_size:int=32
+    block_size:int=128
     strict_decode_invariants:bool=True
     allow_tau_fallback_on_degenerate:bool=False
     degenerate_patience:int=2
@@ -163,6 +163,13 @@ class RuntimeConfig:
     dllm_stop_plateau_patience:int=2
     dllm_stop_plateau_delta_ratio:float=0.01
     dllm_stop_cycle_enabled:bool=True
+    dllm_base_policy:str="shadow_llada21_cap"
+    dllm_base_use_bidirectional:bool=False
+    dllm_base_use_remask:bool=False
+    dllm_shadow_enabled:bool=False
+    dllm_shadow_policy:str="shadow_llada21"
+    dllm_shadow_use_bidirectional:bool=False
+    dllm_shadow_use_remask:bool=True
     run_id:str=""
     strict_fallbacks:bool=False
     fallback_whitelist:List[str]=field(default_factory=lambda:["flash_attention_unavailable","numpy_dll_unavailable","dinfer_missing"])

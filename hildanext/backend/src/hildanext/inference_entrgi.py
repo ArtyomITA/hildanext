@@ -575,6 +575,9 @@ def entrgi_decode(
             else:
                 draft_out = model(input_ids=seq)
         logits = draft_out.logits.detach().clone()
+        # Left-shift alignment: logits[j] predicts token[j+1].
+        # Shift so position j uses logits[j-1] → predicts token[j].
+        logits = F.pad(logits[:, :-1, :], (0, 0, 1, 0))
 
         guidance_applied = False
         step_info: Dict[str, float] = {

@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import os
 import shutil
 import sys
@@ -495,16 +496,20 @@ def _ensure_llada21_objective(cfg:AppConfig)->None:
         raise RuntimeError("llada21_mixture_missing")
 
 def _select_optimizer_name()->str:
+    forced=os.environ.get("HILDANEXT_FORCE_OPTIMIZER","").strip()
+    if forced:
+        logging.info("optimizer forced via HILDANEXT_FORCE_OPTIMIZER=%s",forced)
+        return forced
     if not torch.cuda.is_available():
         return "adamw"
     try:
         import bitsandbytes as bnb
         if hasattr(bnb.optim,"PagedAdamW8bit"):
             return "bnb_paged_adamw8bit"
-        logging.warning("bitsandbytes found but PagedAdamW8bit missing — falling back to adamw8bit")
+        logging.warning("bitsandbytes found but PagedAdamW8bit missing -- falling back to adamw8bit")
         return "adamw8bit"
     except Exception as e:
-        logging.warning("bitsandbytes unavailable (%s) — falling back to adamw (fp32, higher VRAM)",e)
+        logging.warning("bitsandbytes unavailable (%s) -- falling back to adamw (fp32, higher VRAM)",e)
         return "adamw"
 
 def _apply_stage0_to_cfg(cfg:AppConfig,run_id:str|None=None)->AppConfig:
@@ -722,7 +727,7 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         print(f"[preflight_wsd] CACHE_CLEARED elapsed={_t_free1-_t_free0:.2f}s vram_mb={_vram_after_free:.1f} ram_mb={_ram_mb:.0f}",flush=True)
         # ---------- Bidirectional attention runtime test ----------
         # If attention_mode requires bidirectional, verify it actually works.
-        # On failure: auto-disable → fall back to causal_always.
+        # On failure: hard stop (WSD without bidirectional stable is not paper-faithful).
         _exp_cfg=run_cfg.experiment if hasattr(run_cfg,"experiment") else None
         _bidir_mode=getattr(_exp_cfg,"attention_mode","bidirectional_only_stable") if _exp_cfg else "bidirectional_only_stable"
         _bidir_verified=False
@@ -758,25 +763,20 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
                 _bidir_disabled_reason=f"bidir_test_exception: {str(_bidir_err)[:120]}"
                 print(f"[preflight_wsd] BIDIR_TEST_EXCEPTION {_bidir_disabled_reason}",flush=True,file=sys.stderr)
                 torch.cuda.empty_cache()
-            # Failsafe: if test failed, override attention_mode → causal_always
+            # Hard stop: WSD without bidirectional stable is not paper-faithful
             if not _bidir_verified:
-                print(f"[preflight_wsd] BIDIRECTIONAL_STABLE FAILED, DISABLING — falling back to causal_always",flush=True,file=sys.stderr)
-                if _exp_cfg is not None:
-                    _exp_cfg.attention_mode="causal_always"
+                _msg = f"BIDIRECTIONAL_STABLE REQUIRED but verification FAILED: {_bidir_disabled_reason}"
+                print(f"[preflight_wsd] {_msg}", flush=True, file=sys.stderr)
                 if tr is not None:
                     tr.record_fallback(
-                        event="fallback",
+                        event="error",
                         module="wsd_stage0",
                         func="preflight_wsd",
-                        action="bidirectional_disabled",
+                        action="bidirectional_hard_stop",
                         reason=_bidir_disabled_reason,
-                        extra_dict={"original_mode":_bidir_mode,"effective_mode":"causal_always"}
+                        extra_dict={"original_mode":_bidir_mode}
                     )
-                # Save effective config so run_wsd picks up the override
-                _eff_cfg_path=Path(run_cfg.paths.root)/"runs"/"reports"/f"{tr.run_id}_config_effective.json"
-                _eff_cfg_path.parent.mkdir(parents=True,exist_ok=True)
-                save_config(run_cfg,_eff_cfg_path)
-                rep["fallbacks"].append({"event":"fallback","action":"bidirectional_disabled","reason":_bidir_disabled_reason})
+                raise RuntimeError(f"preflight_wsd_bidirectional_failed: {_msg}")
         else:
             _bidir_verified=True  # causal_always doesn't need verification
         # Persist verification status in config so training picks it up
@@ -925,13 +925,21 @@ def run_wsd(cfg:AppConfig,config_path:str,trace=None,skip_dolma_prep:bool=False)
     return rep
 
 def create_stage0_config(cfg:AppConfig,path:Path,dolma_path:str)->AppConfig:
+    # Target schedule: W=1000, S=3000, D=1000, total=5000
+    _total=5000
+    _warmup_frac=0.20
+    _stable_frac=0.60
+    _decay_frac=0.20
+    _warmup=int(_total*_warmup_frac)   # 1000
+    _stable=int(_total*_stable_frac)   # 3000
+    _decay=_total-_warmup-_stable      # 1000
     out_cfg=clone_with_updates(cfg,{
         "data":{"dolma_path":dolma_path,"tinystories_path":"","max_samples":0,"eval_pct_stage0":0.01,"eval_ratio":0.01,"seq_len":1024},
         "runtime":{"use_dinfer":False,"strict_fallbacks":True,"device":"cuda","blocking_fallback_actions":["synthetic_dolma","dummy_model_fallback","download_false_empty","dataset_empty"],"blocking_fallback_reasons":["dolma_unavailable","dataset_empty"],"fallback_whitelist":["flash_attention_unavailable","numpy_dll_unavailable"]},
-        "stage0":{"steps_total_stage0":4000,"lr_stage0":5e-5,"micro_batch_size":1,"grad_accum_steps":8,"seq_len":1024,"log_every_steps":10,"eval_every_steps":500,"save_every_steps":200,"keep_last_checkpoints":3,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":0.10,"stable_frac":0.70,"decay_frac":0.20,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},
-        "train":{"dtype":"fp16","batch_size":1,"accum_steps":8,"grad_ckpt":True,"optimizer":_select_optimizer_name(),"lr":5e-5,"warmup_steps":400,"ckpt_every":200,"eval_every":500,"log_every_steps":10,"keep_last_checkpoints":3,"data_num_workers":0,"data_prefetch_factor":2,"data_persistent_workers":False,"data_pin_memory":True,"cooldown_every_steps":0,"cooldown_seconds":0,"grad_clip":1.0,"lr_min_ratio":0.1,"weight_decay":0.01,"max_tokens":999999999,"multi_turn_t2t":2},
-        "wsd":{"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"end_block_size":32,"enforce_divisibility":True,"max_block_size":1024},
-        "experiment":{"attention_mode":"bidirectional_only_stable","time_param":"continuous_time","loss_weighting":"inv_t","shift_mode":"preserve_left_shift","t_min":0.001,"t_max":1.0,"experiment_id":"s0_ct_bidir_4k","notes":"Stage0 4k WSD: continuous-time ELBO 1/t, bidirectional stable only, preserve left-shift, seq_len=1024, embed_noise for grad stability"},
+        "stage0":{"steps_total_stage0":_total,"lr_stage0":5e-5,"micro_batch_size":1,"grad_accum_steps":8,"seq_len":1024,"log_every_steps":10,"eval_every_steps":500,"save_every_steps":200,"keep_last_checkpoints":5,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":_warmup_frac,"stable_frac":_stable_frac,"decay_frac":_decay_frac,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},
+        "train":{"dtype":"fp16","batch_size":1,"accum_steps":8,"grad_ckpt":True,"optimizer":_select_optimizer_name(),"lr":5e-5,"warmup_steps":_warmup,"max_steps":_total,"ckpt_every":200,"eval_every":500,"log_every_steps":10,"keep_last_checkpoints":5,"data_num_workers":0,"data_prefetch_factor":2,"data_persistent_workers":False,"data_pin_memory":True,"cooldown_every_steps":0,"cooldown_seconds":0,"grad_clip":1.0,"lr_min_ratio":0.1,"weight_decay":0.01,"max_tokens":999999999,"multi_turn_t2t":2},
+        "wsd":{"warmup_steps":_warmup,"stable_steps":_stable,"decay_steps":_decay,"start_block_size":1,"max_block_size":1024,"end_block_size":32,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"enforce_divisibility":True},
+        "experiment":{"attention_mode":"bidirectional_only_stable","time_param":"continuous_time","loss_weighting":"inv_t","shift_mode":"preserve_left_shift","t_min":0.001,"t_max":1.0,"experiment_id":"s0_wsd5k_w1000_s3000_d1000","notes":"Stage0 5k WSD: W=1000(1->1024) S=3000(1024) D=1000(1024->32), continuous-time ELBO 1/t, bidirectional stable only, 3-phase LR"},
         "inference":{"max_steps":8,"max_new_tokens":16}
     })
     path.parent.mkdir(parents=True,exist_ok=True)

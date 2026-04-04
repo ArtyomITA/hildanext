@@ -739,6 +739,9 @@ def s2d2_decode(
                     force_noncausal_ctx=force_noncausal_ctx,
                 )
                 logits = draft_out.logits
+                # Left-shift alignment: logits[j] predicts token[j+1].
+                # Shift so position j uses logits[j-1] → predicts token[j].
+                logits = F.pad(logits[:, :-1, :], (0, 0, 1, 0))
                 probs = F.softmax(logits.float(), dim=-1)
                 confidence, pred_ids = probs.max(dim=-1)
 

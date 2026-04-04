@@ -99,11 +99,17 @@ def _gpu_temp_celsius()->Optional[int]:
         pass
     return None
 
-def _compute_lr(step:int,warmup_steps:int,total_steps:int,base_lr:float,min_ratio:float=0.1)->float:
-    """Linear warmup then cosine decay to base_lr*min_ratio."""
+def _compute_lr(step:int,warmup_steps:int,total_steps:int,base_lr:float,min_ratio:float=0.1,stable_end_step:int=0)->float:
+    """LLaDA 2.0 WSD-aware LR: linear warmup -> constant stable -> cosine decay.
+    If stable_end_step>warmup_steps, LR stays constant from warmup_steps to stable_end_step,
+    then cosine-decays from stable_end_step to total_steps.
+    If stable_end_step<=warmup_steps (legacy), falls back to warmup+cosine (2-phase)."""
     if step<warmup_steps:
         return base_lr*float(step)/max(1,warmup_steps)
-    progress=float(step-warmup_steps)/max(1,total_steps-warmup_steps)
+    if stable_end_step>warmup_steps and step<stable_end_step:
+        return base_lr
+    decay_start=max(warmup_steps,stable_end_step)
+    progress=float(step-decay_start)/max(1,total_steps-decay_start)
     return base_lr*(min_ratio+(1-min_ratio)*0.5*(1+math.cos(math.pi*progress)))
 
 def _t_bucket_key(t:float)->str:
@@ -591,6 +597,8 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     lr_base=float(cfg.train.lr)
     lr_warmup=max(1,int(cfg.train.warmup_steps))
     lr_min_ratio=float(getattr(cfg.train,"lr_min_ratio",0.1) or 0.1)
+    # WSD-aware LR: constant during stable phase (per LLaDA 2.0 paper)
+    lr_stable_end=int(cfg.wsd.warmup_steps)+int(cfg.wsd.stable_steps) if kind=="cpt" else 0
     # Experiment flags
     exp=cfg.experiment if hasattr(cfg,"experiment") else None
     attn_mode=getattr(exp,"attention_mode","bidirectional_only_stable") if exp else "bidirectional_only_stable"
@@ -789,7 +797,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                             cfg=cfg.train,
                             focus_response=focus_response,
                             mask_mode=run_mask_mode,
-                            composite_block_size=cfg.llada2.composite_block_size,
+                            composite_block_size=phase.block_size,
                             trace=tr,
                             cfg_obj=cfg,
                             bidirectional=bidirectional,
@@ -904,7 +912,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     _noise_frac=1.0-float(opt_steps)/float(_embed_noise_warmup_steps)
                     set_embed_noise_std(0.1*max(0.0,_noise_frac))
                 # LR schedule: linear warmup + cosine decay
-                current_lr=_compute_lr(opt_steps,lr_warmup,max_steps,lr_base,lr_min_ratio)
+                current_lr=_compute_lr(opt_steps,lr_warmup,max_steps,lr_base,lr_min_ratio,stable_end_step=lr_stable_end)
                 for pg in opt.param_groups:
                     pg["lr"]=current_lr
                 last_loss=_out_loss_val

@@ -8,7 +8,7 @@ import {
   LaneResult,
   ThinkingMode,
 } from "../../domain/types";
-import { DEFAULT_CHAT_CONFIG, MODEL_CATALOG } from "../../features/chat/catalog";
+import { DEFAULT_CHAT_CONFIG, MODEL_CATALOG, DLLM_MODEL_PATHS } from "../../features/chat/catalog";
 import { runChatTurn } from "../../features/chat/orchestrator";
 import { composeChatInput } from "../../features/chat/promptComposer";
 import { useChatStore } from "../../store/chatStore";
@@ -620,6 +620,7 @@ export function ChatPage() {
             max_new_tokens: 1,
             seed: config.seed,
             effort: "instant",
+            model_override: DLLM_MODEL_PATHS[config.dllmModelId] ?? undefined,
           }),
         });
         if (res.ok) {

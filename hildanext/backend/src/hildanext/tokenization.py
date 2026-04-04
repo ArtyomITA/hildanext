@@ -17,7 +17,33 @@ def load_tokenizer(model_dir:str,trust_remote_code:bool=True,trace=None,cfg=None
     tr=use_trace(cfg,trace)
     try:
         from transformers import AutoTokenizer
-        tok=AutoTokenizer.from_pretrained(model_dir,trust_remote_code=trust_remote_code)
+        attempts=[
+            {"trust_remote_code":trust_remote_code,"local_files_only":True,"fix_mistral_regex":True},
+            {"trust_remote_code":trust_remote_code,"fix_mistral_regex":True},
+            {"trust_remote_code":trust_remote_code,"local_files_only":True},
+            {"trust_remote_code":trust_remote_code},
+        ]
+        tok=None
+        last_err:Exception|None=None
+        for kwargs in attempts:
+            try:
+                tok=AutoTokenizer.from_pretrained(model_dir,**kwargs)
+                break
+            except TypeError:
+                if "fix_mistral_regex" in kwargs:
+                    retry=dict(kwargs)
+                    retry.pop("fix_mistral_regex",None)
+                    try:
+                        tok=AutoTokenizer.from_pretrained(model_dir,**retry)
+                        break
+                    except Exception as e:
+                        last_err=e
+                        continue
+                raise
+            except Exception as e:
+                last_err=e
+        if tok is None:
+            raise last_err or RuntimeError("tokenizer_load_failed")
         if tok.pad_token_id is None:
             tok.pad_token=tok.eos_token
         return tok

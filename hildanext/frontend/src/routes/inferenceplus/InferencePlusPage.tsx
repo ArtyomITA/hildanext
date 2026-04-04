@@ -1,4 +1,5 @@
 import { KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
+import { MODEL_CATALOG, DLLM_MODEL_PATHS } from "../../features/chat/catalog";
 import styles from "./InferencePlusPage.module.css";
 
 type InferenceMode = "RCD" | "OTS" | "S2D2" | "EntRGi";
@@ -215,6 +216,8 @@ export function InferencePlusPage() {
   const [ots, setOts] = useState(defaultOts);
   const [s2d2, setS2d2] = useState(defaultS2d2);
   const [entrgi, setEntRGi] = useState(defaultEntRGi);
+  const [dllmModelId, setDllmModelId] = useState("dllm_wsd_step_04000");
+  const dllmModels = MODEL_CATALOG.filter((m) => m.lane === "dllm");
   const turnsRef = useRef<HTMLDivElement>(null);
   const abortCtrlRef = useRef<AbortController | null>(null);
 
@@ -439,6 +442,7 @@ export function InferencePlusPage() {
           max_new_tokens: 1,
           seed: null,
           effort: "instant",
+          model_override: DLLM_MODEL_PATHS[dllmModelId] ?? undefined,
         }),
       });
       if (res.ok) {
@@ -752,6 +756,24 @@ export function InferencePlusPage() {
         <div className={styles.block}>
           <h3>Load Weights</h3>
           <p className={styles.loadLead}>Carica i pesi dLLM prima di usare RCD / OTS.</p>
+          <label style={{ display: "block", marginBottom: 8 }}>
+            <span style={{ fontSize: "0.78rem", color: "var(--text-dim)" }}>Modello dLLM</span>
+            <select
+              value={dllmModelId}
+              onChange={(e) => setDllmModelId(e.target.value)}
+              disabled={running || loadingWeights}
+              style={{ display: "block", width: "100%", marginTop: 2 }}
+            >
+              {dllmModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+            <span style={{ fontSize: "0.7rem", color: "var(--text-dim)", opacity: 0.7 }}>
+              {dllmModels.find((m) => m.id === dllmModelId)?.description ?? ""}
+            </span>
+          </label>
           <div className={styles.loadStateCard}>
             <div className={styles.loadStateHead}>
               <strong>dLLM</strong>
