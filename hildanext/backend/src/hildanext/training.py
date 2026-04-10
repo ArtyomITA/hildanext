@@ -121,8 +121,30 @@ def _t_bucket_key(t:float)->str:
 _T_BUCKET_NAMES=["0.0-0.1","0.1-0.3","0.3-0.6","0.6-1.0"]
 
 class TokenizedDataset(Dataset):
+    _ID_KEYS=("input_ids","doc_ids")
+    _MASK_KEYS=("attention_mask","response_mask")
     def __init__(self,path:str,max_rows:int|None=None):
-        self.rows=read_jsonl(path,max_rows=max_rows)
+        # Stream-convert: read one JSON line at a time and immediately convert
+        # arrays to compact numpy dtypes so peak RAM stays ~0.6 GB instead of ~6.5 GB.
+        rows:list[Dict[str,Any]]=[]
+        p=Path(path)
+        if p.exists():
+            with p.open("r",encoding="utf-8") as f:
+                for i,line in enumerate(f):
+                    if max_rows is not None and i>=max_rows:
+                        break
+                    line=line.strip()
+                    if not line:
+                        continue
+                    r=json.loads(line)
+                    for k in self._ID_KEYS:
+                        if k in r:
+                            r[k]=np.array(r[k],dtype=np.int32)
+                    for k in self._MASK_KEYS:
+                        if k in r:
+                            r[k]=np.array(r[k],dtype=np.uint8)
+                    rows.append(r)
+        self.rows=rows
     def __len__(self)->int:
         return len(self.rows)
     def __getitem__(self,i:int)->Dict[str,Any]:
@@ -216,6 +238,19 @@ def _collate(batch:List[Dict[str,Any]])->Dict[str,torch.Tensor]:
     first=batch[0]
     if isinstance(first.get("input_ids"),torch.Tensor):
         return {k:torch.stack([x[k] for x in batch]) for k in ("input_ids","doc_ids","attention_mask","response_mask")}
+    # numpy path (TokenizedDataset): np.stack → torch.from_numpy → cast to final dtype
+    if isinstance(first.get("input_ids"),np.ndarray):
+        seq_len=len(first["input_ids"])
+        ids=torch.from_numpy(np.stack([x["input_ids"] for x in batch])).long()
+        docs=torch.from_numpy(np.stack([x["doc_ids"] for x in batch])).long()
+        attn=torch.from_numpy(np.stack([x["attention_mask"] for x in batch])).long()
+        resp_list=[x.get("response_mask") for x in batch]
+        if resp_list[0] is not None:
+            resp=torch.from_numpy(np.stack(resp_list)).long()
+        else:
+            resp=torch.zeros(len(batch),seq_len,dtype=torch.long)
+        return {"input_ids":ids,"doc_ids":docs,"attention_mask":attn,"response_mask":resp}
+    # plain list fallback
     ids=torch.tensor([x["input_ids"] for x in batch],dtype=torch.long)
     docs=torch.tensor([x["doc_ids"] for x in batch],dtype=torch.long)
     attn=torch.tensor([x["attention_mask"] for x in batch],dtype=torch.long)
@@ -497,8 +532,11 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
     tok_path=str(Path(cfg.paths.tokenized_dir)/f"{split_name}.jsonl")
     _t_ds0=time.time()
     # Try memory-mapped Dolma shards first for CPT (avoids loading 5GB JSONL into 37.5GB RAM)
+    # BUT: skip mmap if tokenized_dir explicitly points to a non-Dolma dataset (e.g. Qwen JSONL).
+    # Detection: if tokenized_dir does NOT contain "dolma" in its path, honour the JSONL path.
     _dolma_shard_root=None
-    if kind=="cpt" and hasattr(cfg.data,"dolma_path") and cfg.data.dolma_path:
+    _tok_dir_is_dolma="dolma" in str(cfg.paths.tokenized_dir).lower()
+    if kind=="cpt" and _tok_dir_is_dolma and hasattr(cfg.data,"dolma_path") and cfg.data.dolma_path:
         _candidate=Path(cfg.data.dolma_path).parent  # dolma_path points to /raw, shards are at parent
         if (_candidate/"meta.json").exists():
             _dolma_shard_root=str(_candidate)
@@ -509,8 +547,11 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
         print(f"[_run] DATASET_MMAP_DONE rows={len(ds)} shards={ds.n_shards} elapsed={_t_ds1-_t_ds0:.1f}s ram_approx_mb=2",flush=True)
     else:
         _tok_file_size=Path(tok_path).stat().st_size if Path(tok_path).exists() else 0
-        print(f"[_run] DATASET_LOAD_START path={tok_path} file_size_mb={_tok_file_size//1024//1024}",flush=True)
-        ds=TokenizedDataset(tok_path)
+        # Limit rows for small runs (e.g. probe) to avoid loading the full JSONL
+        _max_rows_needed=steps*max(1,cfg.train.batch_size)*max(1,cfg.train.accum_steps)*2  # 2x margin
+        _max_rows=_max_rows_needed if _max_rows_needed<10000 else None
+        print(f"[_run] DATASET_LOAD_START path={tok_path} file_size_mb={_tok_file_size//1024//1024} max_rows={_max_rows}",flush=True)
+        ds=TokenizedDataset(tok_path,max_rows=_max_rows)
         _t_ds1=time.time()
         print(f"[_run] DATASET_LOAD_DONE rows={len(ds)} elapsed={_t_ds1-_t_ds0:.1f}s ram_approx_mb={len(ds)*4*int(cfg.data.seq_len)//1024//1024}",flush=True)
     if len(ds)==0:
@@ -778,6 +819,33 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                     run_mask_mode="simple_blockdiag" if phase.phase=="stable" else cfg.llada2.mask_mode
                 else:
                     run_mask_mode=cfg.data.doc_mask_mode
+                # Option-2: halve batch seq_len for composite_llada20 phases
+                # (warmup/decay) because composite doubles to 2S internally.
+                # S=1024 → composite=2048 OOMs; S=512 → composite=1024 fits.
+                # Snap to nearest doc boundary ≤ half to avoid cutting mid-document,
+                # which would leave partial <think>/chat turns.  Falls back to
+                # exact half if no boundary found (pure padding or single-doc row).
+                _composite_halved=False
+                if run_mask_mode=="composite_llada20":
+                    _orig_seq=batch["input_ids"].shape[1]
+                    _half=_orig_seq//2
+                    if _half>=64:  # sanity: don't halve below 64 tokens
+                        _doc=batch["doc_ids"]
+                        # Find rightmost doc-boundary ≤ _half (where doc_id changes)
+                        # Don't snap below 3/4 of _half to avoid wasting too many tokens.
+                        _min_cut=max(64,_half*3//4)
+                        _cut=_half
+                        for _ci in range(_half,_min_cut-1,-1):
+                            if _doc[0,_ci].item()!=_doc[0,_ci-1].item():
+                                _cut=_ci
+                                break
+                            if _doc[0,_ci].item()<0:  # hit padding
+                                _cut=_ci
+                                break
+                        batch={k:v[:,:_cut] if v.dim()==2 and v.shape[1]==_orig_seq else v for k,v in batch.items()}
+                        _composite_halved=True
+                        if _global_micro<=2:
+                            print(f"[_run] COMPOSITE_HALVE {_orig_seq}→{_cut} (composite={_cut*2})",flush=True)
                 # --- MTF loop (LLaDA 2.1 S3.1): multi-turn forward data augmentation ---
                 _mtf_original_ids=batch["input_ids"]
                 _mtf_current_ids=_mtf_original_ids
@@ -1098,6 +1166,11 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
             break
     watchdog.stop()
     _signal_save_state.update({"model":None,"tokenizer":None,"optimizer":None,"ckpt_dir":None})
+    # Free model/optimizer/dataset to reclaim RAM+VRAM before returning
+    del model,opt,ds,loader
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     summary=_write_summary(reason="normal")
     return summary
 

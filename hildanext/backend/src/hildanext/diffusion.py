@@ -266,13 +266,31 @@ def _forward(model,input_ids:torch.Tensor,attn_1d:torch.Tensor,doc_ids:torch.Ten
                     print(f"[SDPA_DIAG] backend={bname} mask_shape={list(attn4d.shape)} dtype={attn4d.dtype} H={H} D={D}",flush=True)
                 except Exception as e:
                     print(f"[SDPA_DIAG] probe_failed: {e}",flush=True)
-            if bidirectional:
-                with force_noncausal_attention(model):
-                    out=model(input_ids=ids2,attention_mask=attn4d)
+            # Option-3 optimisation: run backbone on full 2S tokens for
+            # attention context, but apply lm_head only on the first S (x_t)
+            # positions.  Saves ~594 MB VRAM (lm_head on S vs 2S with V=151936).
+            _backbone=getattr(model,"model",None)
+            _lm_head=getattr(model,"lm_head",None)
+            _use_slim=(_backbone is not None and _lm_head is not None)
+            if _use_slim:
+                if bidirectional:
+                    with force_noncausal_attention(model):
+                        backbone_out=_backbone(input_ids=ids2,attention_mask=attn4d)
+                else:
+                    backbone_out=_backbone(input_ids=ids2,attention_mask=attn4d)
+                hidden_xt=backbone_out[0][:,:l,:].contiguous()
+                del backbone_out
+                logits=_lm_head(hidden_xt)
+                del hidden_xt
             else:
-                out=model(input_ids=ids2,attention_mask=attn4d)
-            logits=out.logits[:,:l,:].contiguous()
-            del out
+                # Fallback: full model call (non-standard architectures)
+                if bidirectional:
+                    with force_noncausal_attention(model):
+                        out=model(input_ids=ids2,attention_mask=attn4d)
+                else:
+                    out=model(input_ids=ids2,attention_mask=attn4d)
+                logits=out.logits[:,:l,:].contiguous()
+                del out
             return SimpleNamespace(logits=logits)
         doc_mask=batch_doc_attention_mask(doc_ids,causal=not bidirectional,mask_mode=mask_mode)
         attn4d=_attn_for_model(doc_mask,model)

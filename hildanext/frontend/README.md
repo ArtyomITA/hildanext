@@ -32,16 +32,20 @@ Mockup statici:
 - `src/app/providers.tsx`
   - esegue `useDataStore().hydrate()`
 - `src/app/router.tsx`
-  - route `/wsd`
-  - route `/inference`
-  - redirect `/` -> `/wsd`
+  - redirect `/` -> `/chat`
+  - route `/chat` (ChatPage)
+  - redirect `/inference` -> `/chat`
+  - route `/inferenceplus` (InferencePlusPage)
+  - route `/benchmark` (BenchmarkPage)
+  - route `/legacy/wsd` (WsdPage)
+  - redirect `/wsd` -> `/legacy/wsd`
 
 ## Shell
 - `src/shell/AppShell.tsx`
   - layout globale
   - monta top nav, outlet, status rail
 - `src/shell/TopNav.tsx`
-  - navigazione primaria WSD / Inference
+  - navigazione primaria Chat / Inference+ / Benchmark / Legacy WSD
 - `src/shell/StatusRail.tsx`
   - side summary dipendente dalla route
 

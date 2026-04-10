@@ -358,4 +358,53 @@ These are root causes identified but NOT to be fixed in this session:
 
 ---
 
-*Report generated for coding agent handoff. Include with `python_inventory_full` for complete context.*
+## 11. Resolution (April 2026)
+
+### 11.1 Revised Root Cause
+
+The initial hypotheses in sections 5.1–5.3 (RAM exhaustion, DataLoader deadlock, NumPy DLL) were **contributing factors but not the primary cause** of the system instability.
+
+The **actual root cause** was identified through empirical VRAM probing:
+
+> The `composite_llada20` mask mode doubles the effective sequence length from S=1024 to 2S=2048 by concatenating `[x_t | x_0]`. The `lm_head` linear layer (`[vocab=151936, hidden=1024]`) then computes logits on **all 2048 positions**, producing a tensor of shape `[1, 2048, 151936]` in fp16 = **594 MB**. At that point, ~5.4 GB is already allocated for backbone + gradients + activations. Attempting to allocate 594 MB more pushes past the 8 GB limit, but **does not produce a clean OOM**. Instead, the GPU enters **memory thrashing**: WDDM cannot schedule the Windows Desktop Window Manager (DWM), leading to progressive system degradation that requires a full reboot.
+
+### 11.2 Key Discovery: SDPA Backend
+
+Previous assumption: `force_math_sdpa()` selects the MATH backend (fp32 intermediates = ~268 MB/layer). Actual behavior: `torch._fused_sdp_choice` probe confirmed **EFFICIENT_ATTENTION** is selected for all mask shapes on Pascal (sm_61). Attention is NOT the VRAM bottleneck — the `lm_head` is.
+
+### 11.3 Fix Applied: Option 3 + Option 2
+
+Two complementary changes were implemented:
+
+**Option 3 — Slim lm_head** (`diffusion.py::_forward()` L271–293):
+- For the composite path, call `model.model(input_ids=ids2)` (backbone only) on all 2S tokens
+- Then apply `model.lm_head()` only on the first S positions (the `x_t` tokens that need denoising)
+- Saves ~296 MB (half the lm_head output)
+
+**Option 2 — Halved seq_len for composite phases** (`training.py` L822–840):
+- When `mask_mode == "composite_llada20"` (warmup + decay phases), truncate each batch from S=1024 to S≈512
+- Truncation is **doc-boundary-aware**: snaps to nearest document boundary in range `[3/4 * half, half]`
+- During the stable phase (bidirectional attention, `simple_blockdiag`), full S=1024 is used
+
+### 11.4 Test Results (at `memory_fraction=0.85`)
+
+| Phase | Mask Mode | Effective S | Peak VRAM | Headroom |
+|-------|-----------|-------------|-----------|----------|
+| Warmup/Decay | composite_llada20 | 512 → composite 1024 | 4972 MB | 1287 MB |
+| Stable | simple_blockdiag | 1024 (no doubling) | 5676 MB | 583 MB |
+
+Both phases pass with margin. Multi-turn-t2t (2 turns) also passes.
+
+### 11.5 Updated Config
+
+The WSD schedule was revised to W=1000 / S=3000 / D=1000 (5000 total steps), with:
+- `batch_size=1`, `accum_steps=8`
+- `seq_len=1024`
+- `doc_attention_mask_mode="composite_llada20"` 
+- `set_per_process_memory_fraction(0.85)` in `training.py`
+- `multi_turn_t2t=2`
+- Gradient checkpointing enabled
+
+---
+
+*Report generated for coding agent handoff. Resolution appended April 2026.*

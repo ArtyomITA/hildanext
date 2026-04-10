@@ -716,6 +716,8 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         # Free generate_ar's model — it's out of scope but CUDA cache may hold tensors.
         print(f"[preflight_wsd] AR_TEST_OK text='{ar.get('text','')[:60]}' — clearing CUDA cache",flush=True)
         _t_free0=time.time()
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
         _t_free1=time.time()
         _vram_after_free=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
@@ -742,9 +744,15 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
                     sys.path.insert(0,str(_repo_root))
                 _bidir_mod=importlib.import_module("tools.tests_wsd.test_bidirectional_composite_runtime")
                 _bidir_run_all=_bidir_mod.run_all
+                # NOTE: bidir test uses decay-end block_size (32) from config, not
+                # the dynamic phase.block_size that the training loop uses.
+                # This is intentional: the test verifies that force_noncausal_attention
+                # works with composite masks at a representative block_size.
+                # The training loop correctly passes phase.block_size (training.py L841).
+                _bidir_test_block = int(run_cfg.llada2.composite_block_size)
                 _bidir_report=_bidir_run_all(
                     model_dir=run_cfg.paths.model_dir,
-                    block_size=int(run_cfg.llada2.composite_block_size),
+                    block_size=_bidir_test_block,
                     seq_len=128,
                     out_path=str(Path(run_cfg.paths.root)/"runs"/"reports"/f"{tr.run_id}_bidir_test.json"),
                 )
@@ -779,10 +787,17 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
                 raise RuntimeError(f"preflight_wsd_bidirectional_failed: {_msg}")
         else:
             _bidir_verified=True  # causal_always doesn't need verification
-        # Persist verification status in config so training picks it up
+        # Persist verification status in config so training picks it up.
+        # Write to BOTH the cloned run_cfg AND the original cfg so that
+        # callers that pass the same cfg object to run_wsd() will see it
+        # (clone_with_updates deep-copies, so run_cfg mutation alone is lost).
         if _exp_cfg is not None:
             _exp_cfg.bidirectional_verified=_bidir_verified
             _exp_cfg.bidirectional_disabled_reason=_bidir_disabled_reason
+        _orig_exp=cfg.experiment if hasattr(cfg,"experiment") else None
+        if _orig_exp is not None:
+            _orig_exp.bidirectional_verified=_bidir_verified
+            _orig_exp.bidirectional_disabled_reason=_bidir_disabled_reason
         rep["bidirectional_verified"]=_bidir_verified
         rep["bidirectional_disabled_reason"]=_bidir_disabled_reason
         print(f"[preflight_wsd] PROBE_START seq_len=256 steps=1",flush=True)
@@ -791,7 +806,11 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
         probe=run_wsd_conversion(probe_cfg,steps=1,trace=tr,resume=False,ckpt_every=1,eval_every=2)
         _t_probe1=time.time()
         print(f"[preflight_wsd] PROBE_DONE elapsed={_t_probe1-_t_probe0:.1f}s",flush=True)
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
+        _vram_after_probe=float(torch.cuda.memory_allocated())/1024/1024 if torch.cuda.is_available() else 0.0
+        print(f"[preflight_wsd] PROBE_CLEANUP vram_mb={_vram_after_probe:.1f}",flush=True)
         ckpt=Path(probe["checkpoints_dir"])/"step_00001"
         ckpt_ok=ckpt.exists()
         load_ok=False
@@ -801,6 +820,8 @@ def preflight_wsd(cfg:AppConfig,trace=None)->Dict[str,Any]:
                 _m=AutoModelForCausalLM.from_pretrained(str(ckpt),trust_remote_code=run_cfg.model.trust_remote_code)
                 load_ok=True
                 del _m
+                import gc
+                gc.collect()
                 torch.cuda.empty_cache()
             except Exception as e:
                 if tr is not None:
@@ -878,6 +899,10 @@ def run_wsd(cfg:AppConfig,config_path:str,trace=None,skip_dolma_prep:bool=False)
     tr=use_trace(cfg,trace)
     run_cfg=_apply_stage0_to_cfg(cfg,getattr(tr,"run_id",""))
     _ensure_llada21_objective(run_cfg)
+    # Propagate bidirectional_verified from preflight (set on original cfg.experiment)
+    _orig_bidir=getattr(cfg.experiment,"bidirectional_verified",False) if hasattr(cfg,"experiment") else False
+    if _orig_bidir and hasattr(run_cfg,"experiment"):
+        run_cfg.experiment.bidirectional_verified=True
     if skip_dolma_prep:
         # Prep must have been done separately; just verify tokenized .jsonl exist.
         train_tok=Path(run_cfg.paths.tokenized_dir)/"train.jsonl"
@@ -933,7 +958,12 @@ def create_stage0_config(cfg:AppConfig,path:Path,dolma_path:str)->AppConfig:
     _warmup=int(_total*_warmup_frac)   # 1000
     _stable=int(_total*_stable_frac)   # 3000
     _decay=_total-_warmup-_stable      # 1000
+    # Point tokenized_dir to the Qwen-prepared dataset (GO_100 audited)
+    _root=str(Path(cfg.paths.root))
+    _tok_dir=str(Path(_root)/"data"/"tokenized_qwen_wsd"/"qwen_wsd_run")
+    _proc_dir=str(Path(_root)/"data"/"processed_qwen_wsd"/"qwen_wsd_run")
     out_cfg=clone_with_updates(cfg,{
+        "paths":{"tokenized_dir":_tok_dir,"processed_dir":_proc_dir},
         "data":{"dolma_path":dolma_path,"tinystories_path":"","max_samples":0,"eval_pct_stage0":0.01,"eval_ratio":0.01,"seq_len":1024},
         "runtime":{"use_dinfer":False,"strict_fallbacks":True,"device":"cuda","blocking_fallback_actions":["synthetic_dolma","dummy_model_fallback","download_false_empty","dataset_empty"],"blocking_fallback_reasons":["dolma_unavailable","dataset_empty"],"fallback_whitelist":["flash_attention_unavailable","numpy_dll_unavailable"]},
         "stage0":{"steps_total_stage0":_total,"lr_stage0":5e-5,"micro_batch_size":1,"grad_accum_steps":8,"seq_len":1024,"log_every_steps":10,"eval_every_steps":500,"save_every_steps":200,"keep_last_checkpoints":5,"objective_mode":"llada21_mixture","t2t_enabled":True,"mask_ratio_m2t":0.15,"t2t_edit_ratio":0.10,"m2t_weight":1.0,"t2t_weight":1.0,"warmup_frac":_warmup_frac,"stable_frac":_stable_frac,"decay_frac":_decay_frac,"ladder_blocks":[1,4,32,64,128,256,512,1024],"decay_blocks":[1024,512,256,128,64,32],"doc_packing":True,"doc_attention_mask_mode":"composite_llada20"},

@@ -1,5 +1,5 @@
 # HildaNext Dependency Pins
-Date: 2026-02-22
+Date: 2026-04-10
 Workspace: e:\DIFFUSION\HildaNext
 
 ## Local Environment Check
@@ -7,6 +7,7 @@ Workspace: e:\DIFFUSION\HildaNext
 - python: `3.10.18`
 - torch: `2.4.0+cu121`
 - torch cuda runtime: `12.1`
+- transformers: `4.57.3`
 - note: backend package targets Python `>=3.11`; smoke/test was executed with system Python 3.13.
 
 ## Vendored Repositories
@@ -25,3 +26,17 @@ Workspace: e:\DIFFUSION\HildaNext
 ## Notes
 - dInfer API usage is based on real repo symbols: `dinfer.DiffusionLLMServing` and `dinfer.SamplingParams`.
 - dInfer hard-imports vLLM/sglang in current codebase; backend implements guarded fallback to Transformers/dummy engine.
+
+## Changelog
+### April 2026
+- WSD instability root cause identified: `composite_llada20` doubles seq to 2048, `lm_head` logits cause VRAM thrashing on GTX 1080. See `docs/WSD_INVESTIGATION_REPORT.md §11`.
+- Fix: Option 3 (slim lm_head on x_t only) + Option 2 (halve to S=512 for composite phases). Both in `diffusion.py` and `training.py`.
+- SDPA backend: `EFFICIENT_ATTENTION` (not MATH) confirmed on Pascal via `torch._fused_sdp_choice`.
+- WSD schedule updated: W=1000/S=3000/D=1000 (5000 steps), accum_steps=8, multi_turn_t2t=2.
+- Doc-boundary-aware batch truncation added to `training.py`.
+- Dataset: 60,638 rows × 1024 tokens (Dolma), no retokenization needed.
+- Frontend routes refactored: `/chat`, `/inferenceplus`, `/benchmark`, `/legacy/wsd`.
+- Stale docs deleted: test.md, safe_architecture.md, plan_stage_0.md, full_architecture_reference.md.
+
+### February 2026
+- Initial pin of environment and vendored repos.

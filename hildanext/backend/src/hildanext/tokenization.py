@@ -156,8 +156,9 @@ def _pack(encoded:List[Tuple[List[int],List[int],str]],seq_len:int,pad_id:int,eo
             chunk_resp=resp[pos:pos+take] if resp else [0]*len(chunk_ids)
             pos+=len(chunk_ids)
             if pos>=len(ids):
-                chunk_ids=chunk_ids+[eos_id]
-                chunk_resp=chunk_resp+[0]
+                if eos_id is not None:
+                    chunk_ids=chunk_ids+[eos_id]
+                    chunk_resp=chunk_resp+[0]
             if len(cur_ids)+len(chunk_ids)>seq_len and cur_ids:
                 flush()
                 cur_ids=[]
@@ -220,8 +221,9 @@ def _pack_streaming(
             chunk_resp=resp[pos:pos+take] if resp else [0]*len(chunk_ids)
             pos+=len(chunk_ids)
             if pos>=len(ids):
-                chunk_ids=chunk_ids+[eos_id]
-                chunk_resp=chunk_resp+[0]
+                if eos_id is not None:
+                    chunk_ids=chunk_ids+[eos_id]
+                    chunk_resp=chunk_resp+[0]
             if len(cur_ids)+len(chunk_ids)>seq_len and cur_ids:
                 flush()
                 cur_ids=[]

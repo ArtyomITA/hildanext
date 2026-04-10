@@ -98,8 +98,11 @@ hildanext/
    - Endpoint separato: `POST /generate/ar`.
 
 4. **Attenzione bidirezionale** (`diffusion.py → force_noncausal_attention`):
-   - Context manager che disabilita `is_causal` + monkey-patches `create_causal_mask`.
+   - Context manager che disabilita `is_causal` + monkey-patches `create_causal_mask` in 3 moduli (masking_utils, qwen3, qwen2).
+   - Su transformers 4.57 la maschera 4D composita da sola neutralizza la causalità; il CM è safety net.
+   - Il patch usa identity check (`result is user_mask`) per preservare maschere composite 4D → se transformers copia il tensor internamente, il check si rompe silenziosamente.
    - **Non toccare** a meno che non cambi la versione di transformers.
+   - Dettagli: [docs/BIDIRECTIONAL_ATTENTION_HANDOFF.md](../docs/BIDIRECTIONAL_ATTENTION_HANDOFF.md)
 
 5. **Config** (`config.py`):
    - Tutto è in dataclass (`AppConfig`), serializzato JSON in `runs/configs/`.
@@ -109,6 +112,15 @@ hildanext/
 6. **Serializzazione inferenza**:
    - `serialize_inference=True` di default — un solo `/generate` alla volta (lock con timeout).
    - `require_cuda_for_inference=True` — ritorna 503 se CUDA non disponibile.
+   - Il lock è necessario anche perché `force_noncausal_attention` patcha attributi globali (non thread-safe).
+
+7. **Decode policies** (5 policy nel decode loop, default `shadow_llada21_cap`):
+   - `current_base` (top-k puro), `threshold_cap`, `shadow_llada21`, `shadow_llada21_cap`, `shadow_llada21_delayed_edit`.
+   - Controllate da `cfg.runtime.dllm_base_policy`.
+
+8. **Shadow decode** (off di default, `dllm_shadow_enabled=False`):
+   - Esegue un secondo `diagnostic_dllm_decode` con policy/config separati per telemetria.
+   - Raddoppia il costo inferenza; risultato in `last_stats["shadow"]`.
 
 ### API Endpoints (FastAPI, porta 8080)
 
@@ -178,6 +190,24 @@ hildanext/
 - **`create_causal_mask` monkey-patch**: cambia tra versioni transformers — verificare se si aggiorna transformers.
 - **Non usare `bos_and_shift`** su Qwen3-Base (inietta rumore strutturale nel pretraining diffusion).
 - **`inference_lock`**: un solo request inferenza alla volta — non parallelizzare chiamate `/generate`.
+- **Left-shift off-by-one**: `gen_logits = logits[:, prompt_len-1 : prompt_len-1+max_new]` — dimenticare il `-1` produce predizioni sbagliate senza errore.
+- **`ExperimentConfig.attention_mode` ≠ controllo effettivo**: il decode loop legge solo `cfg.runtime.dllm_base_use_bidirectional`. Settare `attention_mode="bidirectional_always"` senza anche `dllm_base_use_bidirectional=True` non ha effetto.
+- **KV-cache sempre disabilitato** (`use_cache=False`): necessario per forward full-sequence dLLM. Non riabilitare.
+- **Campi config vestigiali**: `RemaskConfig.percentile_safety/block_size/block_stride`, `InferenceConfig.strict_decode_invariants` — definiti ma non usati nel codice.
+
+### Cross-file dependency graph (inferenza)
+
+```
+inference.py
+  ├── force_noncausal_attention ← diffusion.py  (_forward_full_sequence)
+  ├── apply_remask             ← diffusion.py  (_apply_decode_policy_step)
+  ├── llada21_sets             ← formulas.py   (threshold-edit policies)
+  └── NON importa masks.py (usato solo in training)
+
+diffusion.py
+  ├── batch_doc_attention_mask ← masks.py      (_forward training)
+  └── llada2_wsd_block         ← formulas.py   (wsd_block)
+```
 - **Dolma token ID space** può differire dal tokenizer Qwen — il backend normalizza out-of-range.
 
 ---
