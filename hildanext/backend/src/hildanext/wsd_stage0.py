@@ -937,7 +937,24 @@ def run_wsd(cfg:AppConfig,config_path:str,trace=None,skip_dolma_prep:bool=False)
     summary=run_wsd_conversion(run_cfg,steps=int(run_cfg.stage0.steps_total_stage0),trace=tr,resume=True,ckpt_every=int(run_cfg.stage0.save_every_steps),eval_every=max(1,int(run_cfg.stage0.eval_every_steps) if int(run_cfg.stage0.eval_every_steps)>0 else int(run_cfg.stage0.steps_total_stage0)+1))
     ck_root=Path(summary["checkpoints_dir"])
     ckpts=[str(x) for x in sorted(ck_root.glob("step_*"))]
-    fp=read_json(Path(run_cfg.paths.root)/"runs"/"cache"/"dolma_fingerprint.json")
+    fp_path=Path(run_cfg.paths.root)/"runs"/"cache"/"dolma_fingerprint.json"
+    if fp_path.exists():
+        fp=read_json(fp_path)
+    else:
+        fp={
+            "missing":True,
+            "path":str(fp_path),
+            "reason":"dolma_fingerprint_missing_after_run",
+            "skip_dolma_prep":bool(skip_dolma_prep),
+        }
+        if tr is not None:
+            tr.record_notice(
+                module="wsd_stage0",
+                func="run_wsd",
+                action="dolma_fingerprint_missing",
+                reason="cache_missing",
+                extra_dict={"path":str(fp_path),"skip_dolma_prep":bool(skip_dolma_prep)}
+            )
     events=tr.all_events() if tr is not None else []
     blocking=[e for e in events if tr.is_blocking(e,numpy_ok=True)] if tr is not None else []
     ok=bool(int(summary.get("steps",0))>=int(run_cfg.stage0.steps_total_stage0) and len(blocking)==0)

@@ -75,23 +75,43 @@ def _configure_hf_parallel_loading(model_dir:str)->None:
     workers=max(1,min(8,shard_count))
     os.environ.setdefault("HF_PARALLEL_LOADING_WORKERS",str(workers))
 
+def _env_flag(name:str)->bool:
+    v=str(os.environ.get(name,"")).strip().lower()
+    return v in {"1","true","yes","on"}
 
-def _from_pretrained_best_effort(AutoModelForCausalLM:Any,model_dir:str,dtype:Any,trust_remote_code:bool)->Any:
+
+def _hf_direct_device_map(device:torch.device)->Any|None:
+    if device.type!="cuda":
+        return None
+    idx=0 if device.index is None else int(device.index)
+    return {"":idx}
+
+
+def _from_pretrained_best_effort(AutoModelForCausalLM:Any,model_dir:str,dtype:Any,trust_remote_code:bool,device:torch.device)->Tuple[Any,bool]:
     # Try safer/faster combinations first, then fall back for older stacks.
     base={"trust_remote_code":trust_remote_code}
-    attempts=[
-        {**base,"local_files_only":True,"low_cpu_mem_usage":True,"use_safetensors":True},
-        {**base,"local_files_only":True,"low_cpu_mem_usage":True},
-        {**base,"local_files_only":True},
-        dict(base),
-    ]
+    attempts:List[Tuple[Dict[str,Any],bool]]=[]
+    direct_map=_hf_direct_device_map(device) if _env_flag("HILDANEXT_HF_DEVICE_MAP_LOAD") else None
+    if direct_map is not None:
+        attempts.extend([
+            ({**base,"local_files_only":True,"low_cpu_mem_usage":True,"use_safetensors":True,"device_map":direct_map},True),
+            ({**base,"local_files_only":True,"low_cpu_mem_usage":True,"device_map":direct_map},True),
+            ({**base,"local_files_only":True,"device_map":direct_map},True),
+            ({**base,"device_map":direct_map},True),
+        ])
+    attempts.extend([
+        ({**base,"local_files_only":True,"low_cpu_mem_usage":True,"use_safetensors":True},False),
+        ({**base,"local_files_only":True,"low_cpu_mem_usage":True},False),
+        ({**base,"local_files_only":True},False),
+        (dict(base),False),
+    ])
     last_err:Exception|None=None
-    for kwargs in attempts:
+    for kwargs,used_device_map in attempts:
         try:
             try:
-                return AutoModelForCausalLM.from_pretrained(model_dir,dtype=dtype,**kwargs)
+                return AutoModelForCausalLM.from_pretrained(model_dir,dtype=dtype,**kwargs),used_device_map
             except TypeError:
-                return AutoModelForCausalLM.from_pretrained(model_dir,torch_dtype=dtype,**kwargs)
+                return AutoModelForCausalLM.from_pretrained(model_dir,torch_dtype=dtype,**kwargs),used_device_map
         except Exception as e:
             last_err=e
     if last_err is not None:
@@ -135,13 +155,23 @@ def load_model_bundle(cfg:AppConfig,for_training:bool=False,trace=None)->ModelBu
                 from transformers import AutoModelForCausalLM
                 td=dtype_from_name(cfg.train.dtype,device)
                 _configure_hf_parallel_loading(cfg.paths.model_dir)
-                model=_from_pretrained_best_effort(
+                model,used_device_map=_from_pretrained_best_effort(
                     AutoModelForCausalLM,
                     cfg.paths.model_dir,
                     td,
                     cfg.model.trust_remote_code,
+                    device,
                 )
-                model=model.to(device)
+                if not used_device_map:
+                    model=model.to(device)
+                elif tr is not None:
+                    tr.record_notice(
+                        module="inference",
+                        func="load_model_bundle",
+                        action="hf_device_map_load",
+                        reason="env_enabled",
+                        extra_dict={"device_map":getattr(model,"hf_device_map",None),"device":str(device)}
+                    )
             except Exception as e:
                 reason=f"load_failed:{e}"
                 if tr is not None:

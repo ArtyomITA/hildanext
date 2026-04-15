@@ -104,6 +104,8 @@ hildanext/data/
 # [ARTEFATTI DI ESECUZIONE — runs/, logs, cache]
 # Output di training, eval, cache temporanea
 # =============================================================================
+/experiments/
+/hildanext/experiments/
 hildanext/runs/
 hildanext/logs/
 hildanext/cpt/
