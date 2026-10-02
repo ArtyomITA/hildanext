@@ -964,7 +964,7 @@ def _run(cfg:AppConfig,split_name:str,kind:str,steps:int,focus_response:bool,tra
                 grad_norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),grad_clip_val))
                 clip_applied=bool(grad_norm>grad_clip_val)
                 # Gradient explosion detection: if grad_norm is extreme, skip this step
-                # With 1/t ELBO weighting, high grad_norm (100-2000) is expected — clip handles it.
+                # With the 1/t ELBO weighting normalised over all candidates (diffusion.py) the loss stays on the CE scale.
                 # Only skip for truly catastrophic values (NaN/Inf or > 10000x clip).
                 _grad_explosion_threshold=10000*grad_clip_val
                 if not math.isfinite(grad_norm) or grad_norm>_grad_explosion_threshold:

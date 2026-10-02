@@ -415,8 +415,13 @@ def compute_m2t_t2t_losses(model,input_ids:torch.Tensor,attention_mask:torch.Ten
     out=_forward(model,mixed,attention_mask,doc_ids,mask_mode=mask_mode,clean_ids=_target,composite_block_size=composite_block_size,trace=trace,cfg=cfg_obj,bidirectional=bidirectional)
     loss_m2t_raw=_causal_loss(out.logits,m2t_labels)
     if loss_weighting=="inv_t":
+        # LLaDA ELBO (GUIDELINES.md): sum over masked tokens of CE/t, divided by ALL candidate positions.
+        # _causal_loss is the mean over masked tokens, so rescale by masked/candidates (left-shifted like
+        # the loss); dividing that mean by t alone over-weighted low-t batches by up to 1/t_min = 1000x.
         t_clamp=max(float(t_sampled),0.001)
-        loss_m2t=loss_m2t_raw/t_clamp
+        n_masked=int(m2t_labels[:,1:].ne(-100).sum().item())
+        n_cand_shift=max(1,int(cand[:,1:].sum().item()))
+        loss_m2t=loss_m2t_raw*(n_masked/n_cand_shift)/t_clamp
     else:
         loss_m2t=loss_m2t_raw
     loss_t2t=_causal_loss(out.logits,t2t_labels)

@@ -148,44 +148,44 @@ class ContinuousTimeElboTests(unittest.TestCase):
         )
 
     # ---- 1/t ELBO scaling ----
+    # LLaDA GUIDELINES: loss = sum over masked of CE/t, divided by ALL candidate positions.
+    # With the masked-token mean `raw`, that is raw * n_mask / (n_cand * t) (diffusion.py, inv_t).
 
     def test_inv_t_scaling(self):
-        """loss_m2t_scaled = loss_m2t_raw / t  (for loss_weighting='inv_t')."""
-        # Simulate: raw_loss=2.0, t=0.25 → scaled = 2.0/0.25 = 8.0
+        """loss_m2t_scaled = loss_m2t_raw * n_mask / (n_cand * t)  (for loss_weighting='inv_t')."""
+        # Simulate: raw_loss=2.0, t=0.25, 25 of 100 candidates masked -> scaled = 2.0*25/(100*0.25) = 2.0
         raw_loss = torch.tensor(2.0)
-        t = 0.25
-        t_clamp = max(t, 0.001)
-        scaled = raw_loss / t_clamp
+        t, n_mask, n_cand = 0.25, 25, 100
+        scaled = raw_loss * n_mask / (n_cand * max(t, 0.001))
         emit_payload(
             "test_inv_t_scaling",
-            "1/t ELBO weighting: loss_scaled = loss_raw / t.",
-            {"raw_loss": float(raw_loss), "t": t, "scaled": float(scaled), "expected": 8.0},
+            "1/t ELBO weighting: loss_scaled = loss_raw * n_mask / (n_cand * t).",
+            {"raw_loss": float(raw_loss), "t": t, "n_mask": n_mask, "n_cand": n_cand, "scaled": float(scaled), "expected": 2.0},
         )
-        self.assertAlmostEqual(float(scaled), 8.0, places=4)
+        self.assertAlmostEqual(float(scaled), 2.0, places=4)
 
-    def test_inv_t_clamped_at_tmin(self):
-        """At very small t, clamping to 0.001 prevents explosion."""
+    def test_inv_t_no_explosion_at_tmin(self):
+        """At t=t_min about t*n_cand tokens are masked, so the scale stays ~1 instead of 1/t = 1000."""
         raw_loss = torch.tensor(1.0)
-        t = 0.0001  # below t_min
-        t_clamp = max(t, 0.001)
-        scaled = raw_loss / t_clamp
-        expected = 1.0 / 0.001  # 1000
-        self.assertAlmostEqual(float(scaled), expected, places=1)
+        t, n_cand = 0.001, 4000
+        n_mask = 4  # expected t*n_cand
+        scaled = raw_loss * n_mask / (n_cand * max(t, 0.001))
+        self.assertAlmostEqual(float(scaled), 1.0, places=4)
 
     def test_inv_t_scaling_at_t1(self):
-        """At t=1.0, scaling factor is 1 (so loss unchanged)."""
+        """At t=1.0 every candidate is masked, so the loss is unchanged."""
         raw_loss = torch.tensor(3.5)
-        t = 1.0
-        scaled = raw_loss / max(t, 0.001)
+        scaled = raw_loss * 100 / (100 * 1.0)
         self.assertAlmostEqual(float(scaled), float(raw_loss), places=4)
 
-    def test_inv_t_increases_loss_for_small_t(self):
-        """For t<1, 1/t > 1, so scaled loss > raw loss."""
+    def test_inv_t_matches_masked_fraction(self):
+        """For any t, scaling by the realised masked fraction over t is unbiased (E[n_mask] = t*n_cand)."""
         raw_loss = torch.tensor(2.0)
         for t in [0.1, 0.3, 0.5, 0.8]:
-            scaled = float(raw_loss) / max(t, 0.001)
-            self.assertGreater(scaled, float(raw_loss), f"t={t}: scaled should exceed raw")
-
+            n_cand = 1000
+            n_mask = round(t * n_cand)
+            scaled = float(raw_loss) * n_mask / (n_cand * max(t, 0.001))
+            self.assertAlmostEqual(scaled, float(raw_loss), places=3, msg=f"t={t}")
 
 if __name__ == "__main__":
     unittest.main()
